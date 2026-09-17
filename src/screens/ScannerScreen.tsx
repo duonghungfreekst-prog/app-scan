@@ -1,0 +1,416 @@
+import React, { useState, useEffect } from 'react';
+import {
+  View, Text, StyleSheet, TouchableOpacity, Image, TextInput,
+  ScrollView, Alert, KeyboardAvoidingView, Platform, Dimensions, ActivityIndicator,
+  FlatList
+} from 'react-native';
+
+import * as Print from 'expo-print';
+import * as ImagePicker from 'expo-image-picker';
+import * as Sharing from 'expo-sharing';
+import * as FileSystem from 'expo-file-system';
+import * as ImageManipulator from 'expo-image-manipulator';
+import { Ionicons } from '@expo/vector-icons';
+import DocumentScanner from 'react-native-document-scanner-plugin';
+
+import { FilterMode, getCanvasProcessingScript, getCssFilterForMode } from '../utils/imageProcessor';
+import { savePdfToDocuments } from '../utils/fileHelper';
+import CropView, { Point } from '../components/CropView';
+
+const { width, height } = Dimensions.get('window');
+
+export default function ScannerScreen({ route, navigation }: any) {
+  const [images, setImages] = useState<string[]>([]);
+  const genDefaultFileName = () => {
+    return `SCAN_${Date.now()}`;
+  };
+
+  const [filterMode, setFilterMode] = useState<FilterMode>('magic');
+  const [trimMargin, setTrimMargin] = useState(true); // Default to true to remove excess borders
+  const [fileName, setFileName] = useState(genDefaultFileName());
+  const [saving, setSaving] = useState(false);
+  const [sharing, setSharing] = useState(false);
+
+  // Crop State
+  const [isCropping, setIsCropping] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [customCorners, setCustomCorners] = useState<{ [index: number]: Point[] }>({});
+
+  const startScan = async () => {
+    try {
+      const { scannedImages, status } = await DocumentScanner.scanDocument({
+        maxNumDocuments: 20,
+      });
+
+      if (status === 'success' && scannedImages && scannedImages.length > 0) {
+        setImages(prev => [...prev, ...scannedImages]);
+      } else if (images.length === 0) {
+        navigation.goBack();
+      }
+    } catch (e) {
+      console.error(e);
+      Alert.alert('Lỗi', 'Không thể khởi động máy quét tài liệu.');
+      if (images.length === 0) navigation.goBack();
+    }
+  };
+
+  useEffect(() => {
+    // Tự động mở scanner khi mới vào nếu chưa có ảnh
+    if (images.length === 0) {
+      startScan();
+    }
+  }, []);
+
+  const pickImage = async () => {
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ['images'],
+      allowsMultipleSelection: true,
+      quality: 1,
+    });
+    if (!result.canceled && result.assets) {
+      const uris = result.assets.map(a => a.uri);
+      setImages(prev => [...prev, ...uris]);
+    }
+  };
+
+  const handleDeleteImage = (index: number) => {
+    setImages(prev => prev.filter((_, i) => i !== index));
+    setCustomCorners(prev => {
+      const next = { ...prev };
+      delete next[index];
+      const remapped: any = {};
+      Object.keys(next).forEach(k => {
+        const kNum = parseInt(k);
+        if (kNum > index) {
+          remapped[kNum - 1] = next[kNum];
+        } else {
+          remapped[kNum] = next[kNum];
+        }
+      });
+      return remapped;
+    });
+    if (images.length === 1) {
+      navigation.goBack();
+    }
+  };
+
+  const createPdf = async () => {
+    const trimPercent = trimMargin ? 4 : 0; // Tăng lên 4% để loại bỏ triệt để viền lẹm
+    const canvasScript = getCanvasProcessingScript();
+    const cssFilter = getCssFilterForMode(filterMode);
+
+    const imgTagsArray = await Promise.all(images.map(async (imgUri, index) => {
+      let base64Uri = imgUri;
+      if (!imgUri.startsWith('data:')) {
+        try {
+          const manipResult = await ImageManipulator.manipulateAsync(
+            imgUri,
+            [{ resize: { width: 1080 } }],
+            { compress: 0.7, format: ImageManipulator.SaveFormat.JPEG, base64: true }
+          );
+          base64Uri = `data:image/jpeg;base64,${manipResult.base64}`;
+        } catch (e) {
+          console.warn('Image process error:', e);
+          base64Uri = imgUri;
+        }
+      }
+      return `<div class="page">
+        <img id="scanImg_${index}" src="${base64Uri}" style="${filterMode !== 'magic' ? `filter: ${cssFilter};` : ''}" crossorigin="anonymous" />
+      </div>`;
+    }));
+    const imgTags = imgTagsArray.join('');
+
+    const html = `<!DOCTYPE html>
+      <html>
+        <head>
+          <meta charset="utf-8"/>
+          <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            @page { size: 2480px 3508px; margin: 0; }
+            html, body { width: 100%; background: white; }
+            .page {
+              width: 2480px;
+              height: 3508px;
+              display: flex;
+              justify-content: center;
+              align-items: center;
+              page-break-after: always;
+              overflow: hidden;
+              background: white;
+            }
+            .page img, .page canvas {
+              width: 100%;
+              height: 100%;
+              object-fit: contain;
+              display: block;
+            }
+          </style>
+        </head>
+        <body>
+          ${imgTags}
+          <script>
+            ${canvasScript}
+            window.onload = function() {
+              const total = ${images.length};
+              const filter = "${filterMode}";
+              const trimP = ${trimPercent};
+              const customMap = ${JSON.stringify(customCorners)};
+              for (let i = 0; i < total; i++) {
+                const img = document.getElementById('scanImg_' + i);
+                if (img) {
+                  try {
+                    const opts = { trimMarginPercent: trimP, contrast: 1.45 };
+                    if (customMap[i]) {
+                      opts.customCornersRatio = customMap[i];
+                    }
+                    const newSrc = processImageCanvas(img, filter, opts);
+                    img.src = newSrc;
+                  } catch (e) {
+                    console.log('Canvas process error:', e);
+                  }
+                }
+              }
+              setTimeout(() => window.ReactNativeWebView?.postMessage('done'), 1000);
+            };
+          </script>
+        </body>
+      </html>
+    `;
+
+    const { uri } = await Print.printToFileAsync({
+      html,
+      width: 595.28,
+      height: 841.89, 
+      base64: false
+    });
+    return uri;
+  };
+
+  const handleSave = async () => {
+    if (!fileName.trim()) {
+      Alert.alert('Lỗi', 'Vui lòng nhập tên file!');
+      return;
+    }
+    if (images.length === 0) return;
+    
+    setSaving(true);
+    try {
+      const uri = await createPdf();
+      await savePdfToDocuments(uri, fileName);
+      Alert.alert('Thành công', 'Đã lưu PDF vào thư mục Tài liệu!');
+      navigation.goBack();
+    } catch (error: any) {
+      console.error(error);
+      Alert.alert('Lỗi', `Không thể lưu PDF: ${error.message || String(error)}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleShare = async () => {
+    if (images.length === 0) return;
+    setSharing(true);
+    try {
+      const uri = await createPdf();
+      await Sharing.shareAsync(uri, { UTI: '.pdf', mimeType: 'application/pdf', dialogTitle: 'Chia sẻ tài liệu' });
+    } catch (error: any) {
+      console.error(error);
+      Alert.alert('Lỗi', `Không thể chia sẻ PDF: ${error.message || String(error)}`);
+    } finally {
+      setSharing(false);
+    }
+  };
+
+  if (images.length === 0) {
+    return (
+      <View style={[styles.container, { justifyContent: 'center', alignItems: 'center' }]}>
+        <ActivityIndicator size="large" color="#00bfa5" />
+        <Text style={{ color: '#fff', marginTop: 16 }}>Đang khởi động máy quét...</Text>
+      </View>
+    );
+  }
+
+  // Preview Mode
+  return (
+    <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.container}>
+      <View style={styles.header}>
+        <TouchableOpacity style={styles.backBtn} onPress={() => navigation.goBack()}>
+          <Ionicons name="chevron-back" size={28} color="#fff" />
+        </TouchableOpacity>
+        <Text style={styles.headerText}>Chỉnh sửa ({images.length})</Text>
+        <TouchableOpacity style={{ padding: 4 }} onPress={startScan}>
+          <Ionicons name="add-circle" size={28} color="#00bfa5" />
+        </TouchableOpacity>
+      </View>
+
+      <View style={styles.previewContainer}>
+        <FlatList 
+          data={images}
+          horizontal
+          pagingEnabled
+          showsHorizontalScrollIndicator={false}
+          keyExtractor={(_, i) => i.toString()}
+          renderItem={({ item, index }) => (
+            <View style={styles.slide}>
+              <View style={styles.imageCardWrapper}>
+                <Image source={{ uri: item }} style={styles.previewImage} resizeMode="contain" />
+                
+                {/* Crop Button */}
+                <TouchableOpacity style={styles.cropBtn} onPress={() => { setActiveIndex(index); setIsCropping(true); }}>
+                  <Ionicons name="crop" size={24} color="#fff" />
+                </TouchableOpacity>
+
+                <TouchableOpacity style={styles.deleteBtn} onPress={() => handleDeleteImage(index)}>
+                  <Ionicons name="trash" size={24} color="#fff" />
+                </TouchableOpacity>
+                {filterMode === 'magic' && (
+                  <View style={styles.magicBadge}>
+                    <Ionicons name="sparkles" size={12} color="#fff" />
+                    <Text style={styles.magicBadgeText}>Thuật toán Magic</Text>
+                  </View>
+                )}
+                {customCorners[index] && (
+                  <View style={[styles.magicBadge, { top: 44, backgroundColor: 'rgba(255,152,0,0.9)' }]}>
+                    <Ionicons name="scan-outline" size={12} color="#fff" />
+                    <Text style={styles.magicBadgeText}>Đã căn lề</Text>
+                  </View>
+                )}
+              </View>
+            </View>
+          )}
+        />
+      </View>
+
+      {isCropping && (
+        <CropView 
+          imageUri={images[activeIndex]}
+          onCancel={() => setIsCropping(false)}
+          onCropSave={(corners, displaySize) => {
+            const ratios = corners.map(c => ({
+              x: c.x / displaySize.w,
+              y: c.y / displaySize.h
+            }));
+            setCustomCorners(prev => ({ ...prev, [activeIndex]: ratios }));
+            setIsCropping(false);
+          }}
+        />
+      )}
+
+      <View style={styles.colorModeRow}>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.modeScroll}>
+          <TouchableOpacity style={[styles.modeBtn, filterMode === 'magic' && styles.modeBtnActive]} onPress={() => setFilterMode('magic')}>
+            <Text style={[styles.modeBtnText, filterMode === 'magic' && styles.modeBtnTextActive]}>✨ Giấy Thật</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.modeBtn, filterMode === 'original' && styles.modeBtnActive]} onPress={() => setFilterMode('original')}>
+            <Text style={[styles.modeBtnText, filterMode === 'original' && styles.modeBtnTextActive]}>📷 Bản Gốc</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.modeBtn, filterMode === 'bw' && styles.modeBtnActive]} onPress={() => setFilterMode('bw')}>
+            <Text style={[styles.modeBtnText, filterMode === 'bw' && styles.modeBtnTextActive]}>📄 Trắng Đen</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.modeBtn, filterMode === 'grayscale' && styles.modeBtnActive]} onPress={() => setFilterMode('grayscale')}>
+            <Text style={[styles.modeBtnText, filterMode === 'grayscale' && styles.modeBtnTextActive]}>🔘 Xám</Text>
+          </TouchableOpacity>
+        </ScrollView>
+      </View>
+
+      <View style={styles.footer}>
+        <View style={styles.fileNameContainer}>
+          <Ionicons name="document-text" size={20} color="#666" style={{ marginRight: 8 }} />
+          <TextInput
+            style={styles.fileNameInput}
+            value={fileName}
+            onChangeText={setFileName}
+            placeholder="Tên file PDF"
+            placeholderTextColor="#666"
+          />
+        </View>
+        <TouchableOpacity style={[styles.saveBtn, { backgroundColor: '#4a90e2', marginRight: 8 }, sharing && { opacity: 0.55 }]} onPress={handleShare} disabled={sharing || saving}>
+          {sharing ? <ActivityIndicator color="#fff" /> : (
+            <Ionicons name="share-social" size={20} color="#fff" />
+          )}
+        </TouchableOpacity>
+
+        <TouchableOpacity style={[styles.saveBtn, saving && { opacity: 0.55 }]} onPress={handleSave} disabled={saving || sharing}>
+          {saving ? <ActivityIndicator color="#fff" /> : (
+            <>
+              <Ionicons name="save" size={20} color="#fff" style={{ marginRight: 6 }} />
+              <Text style={styles.saveBtnText}>Lưu PDF</Text>
+            </>
+          )}
+        </TouchableOpacity>
+      </View>
+    </KeyboardAvoidingView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: '#000' },
+  header: {
+    paddingTop: 44, paddingBottom: 14, paddingHorizontal: 16,
+    flexDirection: 'row', alignItems: 'center', backgroundColor: '#111',
+    borderBottomWidth: 1, borderBottomColor: '#222'
+  },
+  backBtn: { padding: 4, marginRight: 8 },
+  headerText: { color: '#fff', fontSize: 17, fontWeight: '700', flex: 1, textAlign: 'center', marginRight: 16 },
+  
+  previewContainer: { flex: 1, backgroundColor: '#0d0d0d' },
+  slide: { width, height: '100%', justifyContent: 'center', alignItems: 'center', paddingVertical: 10 },
+  imageCardWrapper: {
+    width: '90%', 
+    aspectRatio: 1 / 1.414, // Tỷ lệ chuẩn giấy A4
+    backgroundColor: '#fff',
+    borderRadius: 4, 
+    overflow: 'hidden', 
+    position: 'relative',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 5,
+    elevation: 8,
+  },
+  previewImage: { width: '100%', height: '100%' },
+  cropBtn: {
+    position: 'absolute', bottom: 16, right: 70,
+    backgroundColor: 'rgba(0,0,0,0.6)', width: 44, height: 44,
+    borderRadius: 22, justifyContent: 'center', alignItems: 'center'
+  },
+  deleteBtn: {
+    position: 'absolute', bottom: 16, right: 16,
+    backgroundColor: 'rgba(220,53,69,0.8)', width: 44, height: 44,
+    borderRadius: 22, justifyContent: 'center', alignItems: 'center'
+  },
+  magicBadge: {
+    position: 'absolute', top: 12, right: 12,
+    backgroundColor: 'rgba(0, 191, 165, 0.9)', paddingVertical: 6, paddingHorizontal: 10,
+    borderRadius: 16, flexDirection: 'row', alignItems: 'center', gap: 4
+  },
+  magicBadgeText: { color: '#fff', fontSize: 12, fontWeight: 'bold' },
+
+  colorModeRow: {
+    paddingVertical: 12, backgroundColor: '#1a1a1a',
+    borderBottomWidth: 1, borderBottomColor: '#2a2a2a'
+  },
+  modeScroll: { paddingHorizontal: 12, gap: 10 },
+  modeBtn: {
+    paddingVertical: 8, paddingHorizontal: 16, borderRadius: 20,
+    backgroundColor: '#2a2a2a', borderWidth: 1, borderColor: '#333'
+  },
+  modeBtnActive: { backgroundColor: '#00bfa5', borderColor: '#00bfa5' },
+  modeBtnText: { color: '#aaa', fontSize: 13, fontWeight: '600' },
+  modeBtnTextActive: { color: '#fff', fontWeight: 'bold' },
+
+  footer: {
+    backgroundColor: '#111', padding: 16, paddingBottom: Platform.OS === 'ios' ? 30 : 16,
+    flexDirection: 'row', alignItems: 'center', gap: 12
+  },
+  fileNameContainer: {
+    flex: 1, flexDirection: 'row', alignItems: 'center',
+    backgroundColor: '#222', borderRadius: 8, paddingHorizontal: 12, height: 44
+  },
+  fileNameInput: { flex: 1, color: '#fff', fontSize: 15, paddingVertical: 8 },
+  saveBtn: {
+    backgroundColor: '#00bfa5', flexDirection: 'row', alignItems: 'center',
+    height: 44, paddingHorizontal: 16, borderRadius: 8
+  },
+  saveBtnText: { color: '#fff', fontSize: 15, fontWeight: 'bold' }
+});

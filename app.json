@@ -1,0 +1,51 @@
+{
+  "expo": {
+    "name": "camscanner-expo",
+    "slug": "camscanner-expo",
+    "version": "2.3.0",
+    "scheme": "camscanner",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true
+    },
+    "locales": {
+      "vi": "./locales/vi.json"
+    },
+    "android": {
+      "versionCode": 3,
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "package": "com.camscanner.app"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-sharing",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow CamScanner to access your camera to scan documents."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow CamScanner to access your photos."
+        }
+      ],
+      [
+        "expo-document-picker",
+        {}
+      ],
+      "expo-web-browser"
+    ]
+  }
+}
