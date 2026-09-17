@@ -2,7 +2,7 @@
   "expo": {
     "name": "camscanner-expo",
     "slug": "camscanner-expo",
-    "version": "2.3.0",
+    "version": "2.5.0",
     "scheme": "camscanner",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
