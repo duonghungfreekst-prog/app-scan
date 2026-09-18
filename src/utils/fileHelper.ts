@@ -1,63 +1,109 @@
 /**
- * fileHelper.ts — Utility lưu/di chuyển file an toàn cho toàn app
- *
- * Root cause của lỗi lưu file:
- * 1. (FileSystem as any).documentDirectory sai — documentDirectory là named export,
- *    không phải property của object. Phải import trực tiếp: { documentDirectory }
- * 2. moveAsync giữa cache → documentDirectory có thể lỗi trên Android (khác partition).
- *    Phải dùng copyAsync + deleteAsync thay thế.
+ * fileHelper.ts — Quản lý file an toàn chuẩn Production
+ * - Không fallback sang cacheDirectory (chống mất dữ liệu người dùng)
+ * - Tự động đánh số tránh ghi đè file cũ
+ * - Phân loại thư mục/tập tin bằng FileSystem.getInfoAsync (isDirectory)
+ * - Cung cấp model DocumentItem hoàn chỉnh
  */
 
 import * as FileSystem from 'expo-file-system/legacy';
 
+export interface DocumentItem {
+  id: string;
+  name: string;
+  uri: string;
+  isDirectory: boolean;
+  size: number;
+  modificationTime: number;
+  extension: string;
+}
+
 /**
- * Trả về đường dẫn thư mục document của app (luôn kết thúc bằng /).
- * Đây là cách đúng để lấy documentDirectory — import trực tiếp từ named export.
+ * Trả về thư mục Document lưu trữ vĩnh viễn của app.
+ * Ném lỗi rõ ràng nếu môi trường không cung cấp, tuyệt đối KHÔNG fallback sang cache.
  */
 export function getDocumentDirectory(): string {
-  // documentDirectory là named export — import trực tiếp
   const fs = FileSystem as any;
-  const dir = fs.documentDirectory ?? fs.cacheDirectory ?? '';
-  return dir;
+  const dir = fs.documentDirectory;
+  if (!dir) {
+    throw new Error('Lỗi lưu trữ: Thư mục DocumentDirectory không khả dụng trên thiết bị này.');
+  }
+  return dir.endsWith('/') ? dir : dir + '/';
 }
 
 /**
  * Di chuyển file an toàn: copy sang đích rồi xóa nguồn.
- * Thay thế moveAsync để tránh lỗi cross-partition trên Android.
+ * Tránh lỗi cross-partition trên Android OS.
  */
 export async function safeMoveFile(from: string, to: string): Promise<void> {
   await FileSystem.copyAsync({ from, to });
   try {
     await FileSystem.deleteAsync(from, { idempotent: true });
-  } catch {
-    // Không nghiêm trọng nếu xóa cache thất bại
+  } catch (e) {
+    console.warn('[FileHelper] Warning deleting temporary source file:', e);
   }
 }
 
 /**
- * Lưu file PDF từ Print.printToFileAsync vào documentDirectory.
- * Trả về URI đích đã lưu.
+ * Tìm tên file duy nhất chưa bị trùng trong thư mục (vd: file.pdf -> file (1).pdf)
+ */
+export async function getUniqueFilePath(dir: string, baseName: string, ext: string): Promise<string> {
+  let cleanName = baseName.replace(/[^\p{L}\p{N}_\-\s]/gu, '_').trim();
+  if (!cleanName) cleanName = 'TaiLieu_' + Date.now();
+
+  const formattedExt = ext.startsWith('.') ? ext : `.${ext}`;
+  let targetUri = `${dir}${cleanName}${formattedExt}`;
+  let counter = 1;
+
+  while (true) {
+    const info = await FileSystem.getInfoAsync(targetUri);
+    if (!info.exists) {
+      return targetUri;
+    }
+    targetUri = `${dir}${cleanName} (${counter})${formattedExt}`;
+    counter++;
+  }
+}
+
+/**
+ * Lưu file PDF từ Print.printToFileAsync vào documentDirectory (tự động chống ghi đè).
  */
 export async function savePdfToDocuments(
   tempUri: string,
-  safeName: string
+  safeName: string,
+  subDir: string = ''
 ): Promise<string> {
-  const docDir = getDocumentDirectory();
-  const targetUri = docDir + safeName + '.pdf';
+  const root = getDocumentDirectory();
+  const dir = subDir ? `${root}${subDir}/` : root;
+  
+  // Đảm bảo thư mục đích tồn tại
+  const dirInfo = await FileSystem.getInfoAsync(dir);
+  if (!dirInfo.exists) {
+    await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
+  }
+
+  const cleanBaseName = safeName.replace(/\.pdf$/i, '');
+  const targetUri = await getUniqueFilePath(dir, cleanBaseName, '.pdf');
   await safeMoveFile(tempUri, targetUri);
   return targetUri;
 }
 
 /**
- * Lưu dữ liệu base64 ra file trong documentDirectory.
- * Trả về URI đã lưu.
+ * Lưu dữ liệu base64 ra file trong documentDirectory (tự động chống ghi đè).
  */
 export async function saveBase64ToDocuments(
   base64Data: string,
-  fileName: string // ví dụ: 'MyDoc.docx'
+  fileName: string,
+  subDir: string = ''
 ): Promise<string> {
-  const docDir = getDocumentDirectory();
-  const targetUri = docDir + fileName;
+  const root = getDocumentDirectory();
+  const dir = subDir ? `${root}${subDir}/` : root;
+
+  const lastDot = fileName.lastIndexOf('.');
+  const baseName = lastDot !== -1 ? fileName.substring(0, lastDot) : fileName;
+  const ext = lastDot !== -1 ? fileName.substring(lastDot) : '';
+
+  const targetUri = await getUniqueFilePath(dir, baseName, ext);
   await FileSystem.writeAsStringAsync(targetUri, base64Data, {
     encoding: FileSystem.EncodingType.Base64,
   });
@@ -65,28 +111,91 @@ export async function saveBase64ToDocuments(
 }
 
 /**
- * Copy file từ ngoài vào documentDirectory (dùng cho import PDF/ảnh).
- * Trả về URI đích.
+ * Copy file từ ngoài vào documentDirectory an toàn.
  */
 export async function copyFileToDocuments(
   sourceUri: string,
-  fileName: string
+  fileName: string,
+  subDir: string = ''
 ): Promise<string> {
-  const docDir = getDocumentDirectory();
-  const targetUri = docDir + fileName;
+  const root = getDocumentDirectory();
+  const dir = subDir ? `${root}${subDir}/` : root;
+
+  const lastDot = fileName.lastIndexOf('.');
+  const baseName = lastDot !== -1 ? fileName.substring(0, lastDot) : fileName;
+  const ext = lastDot !== -1 ? fileName.substring(lastDot) : '';
+
+  const targetUri = await getUniqueFilePath(dir, baseName, ext);
   await FileSystem.copyAsync({ from: sourceUri, to: targetUri });
   return targetUri;
 }
 
 /**
- * Đọc tất cả file trong documentDirectory theo đuôi mở rộng cho phép.
+ * Đọc toàn bộ danh sách tập tin và thư mục kèm metadata chi tiết
+ */
+export async function listDocumentItems(
+  subDir: string = '',
+  supportedExts: string[] = ['.pdf', '.docx', '.xlsx']
+): Promise<DocumentItem[]> {
+  try {
+    const root = getDocumentDirectory();
+    const targetDir = subDir ? `${root}${subDir}/` : root;
+
+    const dirInfo = await FileSystem.getInfoAsync(targetDir);
+    if (!dirInfo.exists) {
+      return [];
+    }
+
+    const fileNames = await FileSystem.readDirectoryAsync(targetDir);
+    const items: DocumentItem[] = [];
+
+    for (const name of fileNames) {
+      if (name.startsWith('.')) continue; // Bỏ qua file ẩn
+
+      const fileUri = `${targetDir}${name}`;
+      try {
+        const info = await FileSystem.getInfoAsync(fileUri);
+        if (!info.exists) continue;
+
+        const isDirectory = !!info.isDirectory;
+        const lastDot = name.lastIndexOf('.');
+        const ext = lastDot !== -1 ? name.substring(lastDot).toLowerCase() : '';
+
+        // Nếu là thư mục hoặc là file thuộc extension được hỗ trợ
+        if (isDirectory || supportedExts.includes(ext) || supportedExts.length === 0) {
+          items.push({
+            id: fileUri,
+            name,
+            uri: fileUri,
+            isDirectory,
+            size: info.size ?? 0,
+            modificationTime: (info as any).modificationTime ?? Date.now(),
+            extension: ext,
+          });
+        }
+      } catch (e) {
+        console.warn(`[FileHelper] Error getting info for ${name}:`, e);
+      }
+    }
+
+    // Sắp xếp: Thư mục lên trước, sau đó sắp xếp theo thời gian sửa đổi mới nhất
+    return items.sort((a, b) => {
+      if (a.isDirectory && !b.isDirectory) return -1;
+      if (!a.isDirectory && b.isDirectory) return 1;
+      return b.modificationTime - a.modificationTime;
+    });
+  } catch (error) {
+    console.error('[FileHelper] Error listing document items:', error);
+    return [];
+  }
+}
+
+/**
+ * Hàm tương thích ngược với code cũ: trả về mảng string tên file/folder
  */
 export async function listDocumentFiles(
   extensions: string[] = ['.pdf', '.docx', '.xlsx']
 ): Promise<string[]> {
-  const docDir = getDocumentDirectory();
-  const all = await FileSystem.readDirectoryAsync(docDir);
-  return all
-    .filter(f => extensions.some(ext => f.endsWith(ext)) || !f.includes('.'))
-    .sort((a, b) => b.localeCompare(a));
+  const items = await listDocumentItems('', extensions);
+  return items.map(item => item.name);
 }

@@ -33,39 +33,49 @@ export default function UpdateChecker() {
 
   const checkUpdate = async () => {
     try {
-      if (GITHUB_USERNAME === 'YOUR_GITHUB_USERNAME') return; // Chưa cấu hình thì bỏ qua
+      if ((GITHUB_USERNAME as string) === 'YOUR_GITHUB_USERNAME') return; // Chưa cấu hình thì bỏ qua
 
       const currentVersion = Constants.expoConfig?.version || '1.0.0';
       const apiUrl = `https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO}/releases/latest`;
       
-      const response = await fetch(apiUrl, {
-        headers: {
-          'Accept': 'application/vnd.github.v3+json',
-          'Cache-Control': 'no-cache'
-        }
-      });
-      
-      if (!response.ok) return;
-      
-      const data = await response.json();
-      const latestVersion = data.tag_name; // Ví dụ: "v2.4.0" hoặc "2.4.0"
-      
-      if (compareVersions(latestVersion, currentVersion) > 0) {
-        // Ưu tiên tìm file .apk trong assets, nếu không thì dẫn tới trang tải HTML
-        let downloadUrl = data.html_url;
-        if (data.assets && data.assets.length > 0) {
-          const apkAsset = data.assets.find((a: any) => a.name.endsWith('.apk'));
-          if (apkAsset) {
-            downloadUrl = apkAsset.browser_download_url;
-          }
-        }
-        
-        setUpdateInfo({
-          hasUpdate: true,
-          newVersion: latestVersion,
-          downloadUrl: downloadUrl,
-          releaseNotes: data.body || 'Bản cập nhật mới có nhiều cải tiến và sửa lỗi.'
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
+
+      try {
+        const response = await fetch(apiUrl, {
+          headers: {
+            'Accept': 'application/vnd.github.v3+json',
+            'Cache-Control': 'no-cache'
+          },
+          signal: controller.signal
         });
+        clearTimeout(timeoutId);
+        
+        if (!response.ok) return;
+        
+        const data = await response.json();
+        const latestVersion = data.tag_name; // Ví dụ: "v2.4.0" hoặc "2.4.0"
+        
+        if (compareVersions(latestVersion, currentVersion) > 0) {
+          // Ưu tiên tìm file .apk trong assets, nếu không thì dẫn tới trang tải HTML
+          let downloadUrl = data.html_url;
+          if (data.assets && data.assets.length > 0) {
+            const apkAsset = data.assets.find((a: any) => a.name.endsWith('.apk'));
+            if (apkAsset) {
+              downloadUrl = apkAsset.browser_download_url;
+            }
+          }
+          
+          setUpdateInfo({
+            hasUpdate: true,
+            newVersion: latestVersion,
+            downloadUrl: downloadUrl,
+            releaseNotes: data.body || 'Bản cập nhật mới có nhiều cải tiến và sửa lỗi.'
+          });
+        }
+      } catch (fetchErr) {
+        clearTimeout(timeoutId);
+        // Bỏ qua lỗi timeout hoặc mạng không khả dụng khi kiểm tra ngầm
       }
     } catch (error) {
       console.log('Update check error:', error);

@@ -17,18 +17,21 @@ const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
 pkg.version = newVersion;
 fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
 
-// 2. Cập nhật app.json
+// 2. Cập nhật app.json & tự động tăng versionCode
 const appJsonPath = './app.json';
 const appJson = JSON.parse(fs.readFileSync(appJsonPath, 'utf8'));
 appJson.expo.version = newVersion;
+if (!appJson.expo.android) appJson.expo.android = {};
+const oldVersionCode = appJson.expo.android.versionCode || 1;
+appJson.expo.android.versionCode = oldVersionCode + 1;
 fs.writeFileSync(appJsonPath, JSON.stringify(appJson, null, 2));
 
-console.log('Đã cập nhật file cấu hình.');
+console.log(`Đã cập nhật file cấu hình: version=${newVersion}, versionCode=${appJson.expo.android.versionCode} (từ ${oldVersionCode}).`);
 
 // 3. Commit và Push lên GitHub kèm Tag
 try {
   execSync('git add package.json app.json', { stdio: 'inherit' });
-  execSync(`git commit -m "Cập nhật phiên bản lên v${newVersion}"`, { stdio: 'inherit' });
+  execSync(`git commit -m "Cập nhật phiên bản lên v${newVersion} (code ${appJson.expo.android.versionCode})"`, { stdio: 'inherit' });
   execSync(`git tag v${newVersion}`, { stdio: 'inherit' });
   execSync('git push', { stdio: 'inherit' });
   execSync('git push --tags', { stdio: 'inherit' });

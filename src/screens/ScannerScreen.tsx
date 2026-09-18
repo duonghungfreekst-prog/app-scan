@@ -15,6 +15,8 @@ import DocumentScanner from 'react-native-document-scanner-plugin';
 
 import { FilterMode, getCanvasProcessingScript, getCssFilterForMode } from '../utils/imageProcessor';
 import { savePdfToDocuments } from '../utils/fileHelper';
+import Storage from '../utils/storage';
+import { SCAN_QUALITY_KEY, COLOR_MODE_KEY, SAVE_ORIGINAL_KEY } from './MeScreen';
 import CropView, { Point } from '../components/CropView';
 
 const { width, height } = Dimensions.get('window');
@@ -26,6 +28,8 @@ export default function ScannerScreen({ route, navigation }: any) {
   };
 
   const [filterMode, setFilterMode] = useState<FilterMode>('magic');
+  const [scanQuality, setScanQuality] = useState<'high' | 'medium' | 'low'>('high');
+  const [saveOriginal, setSaveOriginal] = useState(true);
   const [trimMargin, setTrimMargin] = useState(true); // Default to true to remove excess borders
   const [fileName, setFileName] = useState(genDefaultFileName());
   const [saving, setSaving] = useState(false);
@@ -35,6 +39,53 @@ export default function ScannerScreen({ route, navigation }: any) {
   const [isCropping, setIsCropping] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
   const [customCorners, setCustomCorners] = useState<{ [index: number]: Point[] }>({});
+  const [sessionChecked, setSessionChecked] = useState(false);
+
+  const DRAFT_SCAN_SESSION_KEY = 'DRAFT_SCAN_SESSION';
+
+  // Tự động lưu draft session mỗi khi images thay đổi
+  useEffect(() => {
+    if (!sessionChecked) return;
+    const saveDraft = async () => {
+      try {
+        if (images.length > 0) {
+          await Storage.setItem(
+            DRAFT_SCAN_SESSION_KEY,
+            JSON.stringify({
+              images,
+              fileName,
+              filterMode,
+              timestamp: Date.now(),
+            })
+          );
+        } else {
+          await Storage.removeItem(DRAFT_SCAN_SESSION_KEY);
+        }
+      } catch (e) {
+        console.warn('[Scanner] Failed to save draft session:', e);
+      }
+    };
+    saveDraft();
+  }, [images, fileName, filterMode, sessionChecked]);
+
+  useEffect(() => {
+    // Tải cấu hình từ Cài đặt
+    const initSettings = async () => {
+      try {
+        const q = await Storage.getItem(SCAN_QUALITY_KEY);
+        const c = await Storage.getItem(COLOR_MODE_KEY);
+        const s = await Storage.getItem(SAVE_ORIGINAL_KEY);
+        if (q === 'high' || q === 'medium' || q === 'low') setScanQuality(q);
+        if (c === 'grayscale') setFilterMode('grayscale');
+        else if (c === 'bw') setFilterMode('bw');
+        else if (c === 'color') setFilterMode('magic');
+        if (s !== null) setSaveOriginal(s === 'true');
+      } catch (e) {
+        console.warn('[Scanner] Failed to read user settings:', e);
+      }
+    };
+    initSettings();
+  }, []);
 
   const startScan = async () => {
     try {
@@ -55,10 +106,51 @@ export default function ScannerScreen({ route, navigation }: any) {
   };
 
   useEffect(() => {
-    // Tự động mở scanner khi mới vào nếu chưa có ảnh
-    if (images.length === 0) {
+    // Kiểm tra draft session trước khi bắt đầu quét mới
+    const checkDraftAndInit = async () => {
+      try {
+        const rawDraft = await Storage.getItem(DRAFT_SCAN_SESSION_KEY);
+        if (rawDraft) {
+          const draft = JSON.parse(rawDraft);
+          const isRecent = Date.now() - (draft.timestamp || 0) < 24 * 60 * 60 * 1000;
+          if (isRecent && Array.isArray(draft.images) && draft.images.length > 0) {
+            Alert.alert(
+              '📄 Khôi phục phiên quét',
+              `Tìm thấy phiên quét dở dang gồm ${draft.images.length} trang chưa lưu. Bạn có muốn tiếp tục không?`,
+              [
+                {
+                  text: 'Bỏ qua',
+                  style: 'destructive',
+                  onPress: async () => {
+                    await Storage.removeItem(DRAFT_SCAN_SESSION_KEY);
+                    setSessionChecked(true);
+                    startScan();
+                  },
+                },
+                {
+                  text: 'Khôi phục',
+                  onPress: () => {
+                    setImages(draft.images);
+                    if (draft.fileName) setFileName(draft.fileName);
+                    if (draft.filterMode) setFilterMode(draft.filterMode);
+                    setSessionChecked(true);
+                  },
+                },
+              ]
+            );
+            return;
+          } else {
+            await Storage.removeItem(DRAFT_SCAN_SESSION_KEY);
+          }
+        }
+      } catch (e) {
+        console.warn('[Scanner] Error checking draft:', e);
+      }
+      setSessionChecked(true);
       startScan();
-    }
+    };
+
+    checkDraftAndInit();
   }, []);
 
   const pickImage = async () => {
@@ -73,8 +165,9 @@ export default function ScannerScreen({ route, navigation }: any) {
     }
   };
 
-  const handleDeleteImage = (index: number) => {
-    setImages(prev => prev.filter((_, i) => i !== index));
+  const handleDeleteImage = async (index: number) => {
+    const remaining = images.filter((_, i) => i !== index);
+    setImages(remaining);
     setCustomCorners(prev => {
       const next = { ...prev };
       delete next[index];
@@ -89,7 +182,8 @@ export default function ScannerScreen({ route, navigation }: any) {
       });
       return remapped;
     });
-    if (images.length === 1) {
+    if (remaining.length === 0) {
+      await Storage.removeItem(DRAFT_SCAN_SESSION_KEY);
       navigation.goBack();
     }
   };
@@ -99,14 +193,28 @@ export default function ScannerScreen({ route, navigation }: any) {
     const canvasScript = getCanvasProcessingScript();
     const cssFilter = getCssFilterForMode(filterMode);
 
-    const imgTagsArray = await Promise.all(images.map(async (imgUri, index) => {
+    // Chọn tham số nén theo scanQuality đã cấu hình
+    let targetWidth = 1200;
+    let targetCompress = 0.75;
+    if (scanQuality === 'high') {
+      targetWidth = 1600;
+      targetCompress = 0.90;
+    } else if (scanQuality === 'low') {
+      targetWidth = 900;
+      targetCompress = 0.60;
+    }
+
+    // Xử lý tuần tự tránh dồn ép RAM cùng lúc (OOM protection)
+    const imgTagsArray: string[] = [];
+    for (let index = 0; index < images.length; index++) {
+      const imgUri = images[index];
       let base64Uri = imgUri;
       if (!imgUri.startsWith('data:')) {
         try {
           const manipResult = await ImageManipulator.manipulateAsync(
             imgUri,
-            [{ resize: { width: 1080 } }],
-            { compress: 0.7, format: ImageManipulator.SaveFormat.JPEG, base64: true }
+            [{ resize: { width: targetWidth } }],
+            { compress: targetCompress, format: ImageManipulator.SaveFormat.JPEG, base64: true }
           );
           base64Uri = `data:image/jpeg;base64,${manipResult.base64}`;
         } catch (e) {
@@ -114,10 +222,10 @@ export default function ScannerScreen({ route, navigation }: any) {
           base64Uri = imgUri;
         }
       }
-      return `<div class="page">
+      imgTagsArray.push(`<div class="page">
         <img id="scanImg_${index}" src="${base64Uri}" style="${filterMode !== 'magic' ? `filter: ${cssFilter};` : ''}" crossorigin="anonymous" />
-      </div>`;
-    }));
+      </div>`);
+    }
     const imgTags = imgTagsArray.join('');
 
     const html = `<!DOCTYPE html>
@@ -197,6 +305,23 @@ export default function ScannerScreen({ route, navigation }: any) {
     try {
       const uri = await createPdf();
       await savePdfToDocuments(uri, fileName);
+
+      // Nếu người dùng chọn KHÔNG giữ ảnh gốc, dọn dẹp các file cache ảnh scan tạm
+      if (!saveOriginal) {
+        for (const imgUri of images) {
+          try {
+            if (imgUri.startsWith('file://')) {
+              await FileSystem.deleteAsync(imgUri, { idempotent: true });
+            }
+          } catch (delErr) {
+            console.warn('[Scanner] Could not clean up temp image:', delErr);
+          }
+        }
+      }
+
+      // Xóa draft session sau khi lưu thành công
+      await Storage.removeItem(DRAFT_SCAN_SESSION_KEY);
+
       Alert.alert('Thành công', 'Đã lưu PDF vào thư mục Tài liệu!');
       navigation.goBack();
     } catch (error: any) {

@@ -13,6 +13,9 @@ import { useTheme } from '../theme';
 // Heavy libs — lazy-loaded khi dùng để tránh crash khởi động
 // pdf-lib, docx, xlsx, nerdamer được require() trong từng hàm
 import Storage from '../utils/storage';
+import GeminiService from '../services/ai/gemini.service';
+import MathSolverService from '../services/ai/math.solver';
+import TranslationService from '../services/translation/translation.service';
 const { width } = Dimensions.get('window');
 
 export default function ToolsScreen({ route }: any) {
@@ -273,28 +276,10 @@ export default function ToolsScreen({ route }: any) {
     }
   };
 
-  // OCR qua Gemini Vision API (thay thế expo-mlkit-ocr bị abandon)
+  // OCR qua Gemini Vision API
   const ocrViaGemini = async (imageUri: string): Promise<string> => {
-    const userKey = await Storage.getItem('@camscanner_gemini_api_key');
-    const apiKey = userKey && userKey.trim() ? userKey.trim() : null;
-    if (!apiKey) throw new Error('NO_KEY');
-
     const b64 = await FileSystem.readAsStringAsync(imageUri, { encoding: FileSystem.EncodingType.Base64 });
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [
-            { text: 'Please extract ALL text from this image exactly as it appears. Return only the extracted text, nothing else.' },
-            { inline_data: { mime_type: 'image/jpeg', data: b64 } }
-          ]}]
-        })
-      }
-    );
-    const json = await res.json();
-    return json?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    return await GeminiService.ocrImage(b64);
   };
 
   const handleExtractText = async () => {
@@ -307,12 +292,9 @@ export default function ToolsScreen({ route }: any) {
         try {
           text = await ocrViaGemini(scannedImages[0]);
         } catch (e: any) {
-          if (e?.message === 'NO_KEY') {
-            setLoading(false);
-            Alert.alert('⚠️ Cần API Key', 'Vui lòng nhập Gemini API Key trong tab Cài đặt để dùng tính năng OCR.');
-            return;
-          }
-          text = 'Không thể nhận dạng văn bản. Vui lòng thử lại.';
+          setLoading(false);
+          Alert.alert('⚠️ Lỗi OCR', e.message || 'Vui lòng kiểm tra lại API Key trong tab Cài đặt.');
+          return;
         }
         setOcrResultText(text || 'Không tìm thấy chữ trong hình.');
         setLoading(false);
@@ -329,50 +311,34 @@ export default function ToolsScreen({ route }: any) {
     try {
       const scannedImages = await captureImageForProcessing({});
       if (scannedImages && scannedImages.length > 0) {
-        setLoadingText('AI Multimodal đang phân tích & giải bài toán...');
+        setLoadingText('AI đang phân tích & giải bài toán...');
         setLoading(true);
         const imageUri = scannedImages[0];
         
-        // 1. OCR qua Gemini Vision (on-device OCR đã bị loại bỏ do expo-mlkit-ocr kông tương thích)
         let equation = '';
         try {
           equation = await ocrViaGemini(imageUri);
         } catch {
-          // Không có API key — bỏ qua bước này, Gemini sẽ giải trực tiếp từ ảnh
+          // Bỏ qua nếu chưa có API key để Gemini giải trực tiếp
         }
 
         let localSolution = '';
         if (equation) {
-          try {
-            const _nerdamer = require('nerdamer'); require('nerdamer/Algebra'); require('nerdamer/Calculus'); require('nerdamer/Solve');
-            let cleanEq = equation.replace(/\s/g, '').toLowerCase();
-            cleanEq = cleanEq.replace(/s/g, '5').replace(/o/g, '0');
-            let ans;
-            if (cleanEq.includes('=')) {
-              ans = _nerdamer.solveEquations(cleanEq, 'x');
-            } else {
-              ans = _nerdamer(cleanEq).evaluate();
-            }
-            localSolution = `📐 Nhận dạng nhanh CAS:\nBiểu thức: ${cleanEq}\nKết quả: ${ans.toString()}\n\n`;
-          } catch (casErr) {
-            // Tiếp tục dùng Gemini AI Vision
+          const casResult = MathSolverService.solveWithCas(equation);
+          if (casResult.success) {
+            localSolution = `${casResult.result}\n\n`;
           }
         }
 
-        // 2. Gemini Multimodal Vision API (Giải bài toán hình học / sơ đồ / bài tập phức tạp)
-        try {
-          const userKey = await Storage.getItem('@camscanner_gemini_api_key');
-          const apiKey = userKey && userKey.trim() ? userKey.trim() : null;
-
-          if (!apiKey) {
-            // Không có key → dùng kết quả On-Device, thông báo cụ thể
-            if (localSolution) {
-              setSolverResult(`${localSolution}💡 Để phân tích hình vẽ hình học & sơ đồ nâng cao, hãy nhập Gemini API Key trong Cài đặt → Tài khoản.`);
-            } else {
-              setSolverResult(`📌 Nhận dạng văn bản (On-Device):\n${equation}\n\n💡 Để dùng AI Vision giải toán phức tạp, hãy nhập Gemini API Key trong Cài đặt → Tài khoản.`);
-            }
+        const apiKey = await GeminiService.getApiKey();
+        if (!apiKey) {
+          if (localSolution) {
+            setSolverResult(`${localSolution}💡 Để phân tích hình vẽ & sơ đồ nâng cao, hãy nhập Gemini API Key trong Cài đặt.`);
           } else {
-            // Có key → nén ảnh xuống ~800px trước khi encode Base64 (giảm 70-80% kích thước)
+            setSolverResult(`📌 Nhận dạng văn bản (On-Device):\n${equation}\n\n💡 Để dùng AI Vision giải toán phức tạp, hãy nhập Gemini API Key trong Cài đặt.`);
+          }
+        } else {
+          try {
             const ImageManipulator = require('expo-image-manipulator');
             const compressed = await ImageManipulator.manipulateAsync(
               imageUri,
@@ -380,47 +346,16 @@ export default function ToolsScreen({ route }: any) {
               { compress: 0.75, format: ImageManipulator.SaveFormat.JPEG }
             );
             const base64Data = await FileSystem.readAsStringAsync(compressed.uri, { encoding: FileSystem.EncodingType.Base64 });
-            const geminiPrompt = "Bạn là chuyên gia giải toán & phân tích hình ảnh AI. Hãy giải chi tiết bài toán/câu hỏi trong ảnh này (bao gồm cả hình vẽ hình học, sơ đồ, hệ phương trình nếu có). Hãy liệt kê từng bước suy luận (Step-by-step) bằng tiếng Việt rõ ràng, kèm công thức toán Unicode/LaTeX và đáp án cuối cùng.";
-
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 30000);
-            try {
-              const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                signal: controller.signal,
-                body: JSON.stringify({
-                  contents: [{
-                    parts: [
-                      { text: geminiPrompt },
-                      { inline_data: { mime_type: 'image/jpeg', data: base64Data } }
-                    ]
-                  }]
-                })
-              });
-              clearTimeout(timeout);
-              const json = await response.json();
-              if (json && json.candidates && json.candidates[0]?.content?.parts[0]?.text) {
-                const aiText = json.candidates[0].content.parts[0].text;
-                setSolverResult(`🤖 Gemini 1.5 Flash Vision Solver Pro:\n\n${aiText}`);
-              } else if (json?.error?.message) {
-                // Key sai / quota hết → thông báo có hành động cụ thể
-                setSolverResult(`${localSolution}⚠️ Gemini API lỗi: ${json.error.message}\n\nVui lòng kiểm tra lại API Key trong Cài đặt → Tài khoản.`);
-              } else if (localSolution) {
-                setSolverResult(`${localSolution}✨ Mẹo: Kết nối Internet để AI Vision phân tích cả hình vẽ & sơ đồ.`);
-              } else {
-                setSolverResult(`📌 Nhận dạng văn bản:\n${equation}\n\n⚠️ Không thể tính toán biểu thức này. Vui lòng kiểm tra lại hình ảnh.`);
-              }
-            } catch (fetchErr: any) {
-              clearTimeout(timeout);
-              throw fetchErr;
+            const prompt = "Bạn là chuyên gia giải toán & phân tích hình ảnh AI. Hãy giải chi tiết bài toán/câu hỏi trong ảnh này (bao gồm cả hình vẽ hình học, sơ đồ, hệ phương trình nếu có). Hãy liệt kê từng bước suy luận (Step-by-step) bằng tiếng Việt rõ ràng, kèm công thức toán Unicode/LaTeX và đáp án cuối cùng.";
+            
+            const aiText = await GeminiService.generateContentWithImage(prompt, base64Data);
+            setSolverResult(`🤖 Gemini Vision Solver Pro:\n\n${aiText}`);
+          } catch (aiErr: any) {
+            if (localSolution) {
+              setSolverResult(`${localSolution}⚠️ Lỗi kết nối Gemini: ${aiErr.message || String(aiErr)}`);
+            } else {
+              setSolverResult(`⚠️ Lỗi phân tích: ${aiErr.message || String(aiErr)}`);
             }
-          }
-        } catch (visionErr: any) {
-          if (localSolution) {
-            setSolverResult(`${localSolution}✨ Đã giải xong bằng Engine CAS trên máy.`);
-          } else {
-            setSolverResult(`📌 Nhận dạng văn bản:\n${equation}\n\n⚠️ Vui lòng đảm bảo hình ảnh phép toán hoặc bài tập rõ nét.`);
           }
         }
 
@@ -438,11 +373,12 @@ export default function ToolsScreen({ route }: any) {
     try {
       const scannedImages = await captureImageForProcessing({});
       if (scannedImages && scannedImages.length > 0) {
-        const { recognizeText: _ocr } = { recognizeText: ocrViaGemini }; // Gemini OCR
         setLoadingText('Đang dịch thuật...');
         setLoading(true);
         let text = '';
-        try { text = await ocrViaGemini(scannedImages[0]); } catch {
+        try {
+          text = await ocrViaGemini(scannedImages[0]);
+        } catch {
           setLoading(false);
           Alert.alert('⚠️ Cần API Key', 'Vui lòng nhập Gemini API Key trong tab Cài đặt.');
           return;
@@ -454,25 +390,14 @@ export default function ToolsScreen({ route }: any) {
         }
 
         setTranslateOriginal(text);
-        
-        const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=vi&dt=t&q=${encodeURIComponent(text)}`;
-        const response = await fetch(url);
-        const json = await response.json();
-        
-        let translated = '';
-        if (json && json[0]) {
-          json[0].forEach((item: any) => {
-            if (item[0]) translated += item[0];
-          });
-        }
-        
-        setTranslateResult(translated || 'Không thể dịch đoạn văn này.');
+        const translated = await TranslationService.translate(text);
+        setTranslateResult(translated);
         setLoading(false);
         setTranslateModalVisible(true);
       }
-    } catch (e) {
+    } catch (e: any) {
       setLoading(false);
-      Alert.alert('Lỗi', 'Có lỗi kết nối mạng (cần Internet để dịch).');
+      Alert.alert('Lỗi', e.message || 'Có lỗi kết nối mạng.');
     }
   };
 

@@ -32,6 +32,9 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
+      - name: Generate Android Native Project (Expo Prebuild)
+        run: npx expo prebuild --platform android --no-install
+
       - name: Grant execute permission for gradlew
         run: chmod +x android/gradlew
 

@@ -3,10 +3,13 @@ import { View, Text, StyleSheet, TouchableOpacity, Alert, Switch, ScrollView, Te
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import Storage from '../utils/storage';
+import SecureStorage from '../core/security/secureStorage';
+import Constants from 'expo-constants';
 import { useTheme } from '../theme';
 
-const SCAN_QUALITY_KEY = '@camscanner_scan_quality';
-const COLOR_MODE_KEY = '@camscanner_color_mode';
+export const SCAN_QUALITY_KEY = '@camscanner_scan_quality';
+export const COLOR_MODE_KEY = '@camscanner_color_mode';
+export const SAVE_ORIGINAL_KEY = '@camscanner_save_original';
 
 export default function MeScreen({ navigation }: any) {
   const { theme, isDark, toggleDark } = useTheme();
@@ -22,9 +25,11 @@ export default function MeScreen({ navigation }: any) {
     try {
       const q = await Storage.getItem(SCAN_QUALITY_KEY);
       const c = await Storage.getItem(COLOR_MODE_KEY);
-      const key = await Storage.getItem('@camscanner_gemini_api_key');
+      const s = await Storage.getItem(SAVE_ORIGINAL_KEY);
+      const key = await SecureStorage.getItem('@camscanner_gemini_api_key');
       if (q) setScanQuality(q as any);
       if (c) setColorMode(c as any);
+      if (s !== null) setSaveOriginal(s === 'true');
       if (key) setGeminiApiKey(key);
     } catch {
       // KHÔNG log lỗi với dữ liệu nhạy cảm
@@ -37,24 +42,29 @@ export default function MeScreen({ navigation }: any) {
     catch { console.warn('[UI] Failed to save setting'); }
   };
 
+  const handleToggleSaveOriginal = async (val: boolean) => {
+    setSaveOriginal(val);
+    await saveSetting(SAVE_ORIGINAL_KEY, String(val));
+  };
+
   const saveGeminiKey = async () => {
     const trimmedKey = geminiApiKey.trim();
-    // Validate cơ bản (chiều dài tối thiểu) thay vì ép buộc prefix
+    // Validate cơ bản (chiều dài tối thiểu)
     if (trimmedKey && trimmedKey.length < 10) {
       Alert.alert('⚠️ Key không hợp lệ', 'Vui lòng nhập API Key hợp lệ.');
       return;
     }
     try {
-      await Storage.setItem('@camscanner_gemini_api_key', trimmedKey);
       if (trimmedKey) {
-        Alert.alert('✅ Đã lưu', 'Gemini Vision API Key đã được lưu an toàn!');
+        await SecureStorage.setItem('@camscanner_gemini_api_key', trimmedKey);
+        Alert.alert('✅ Đã lưu', 'Gemini Vision API Key đã được mã hóa và lưu an toàn trong phần cứng (Keystore/Keychain)!');
       } else {
+        await SecureStorage.removeItem('@camscanner_gemini_api_key');
         Alert.alert('✅ Đã xóa', 'API Key đã được xóa. App sẽ dùng chế độ On-Device.');
       }
     } catch {
-      // KHÔNG log lỗi chi tiết liên quan đến key
       console.warn('[UI] Failed to save API key');
-      Alert.alert('Lỗi', 'Không thể lưu API Key. Vui lòng thử lại.');
+      Alert.alert('Lỗi', 'Không thể lưu API Key an toàn. Vui lòng thử lại.');
     }
   };
 
@@ -170,7 +180,7 @@ export default function MeScreen({ navigation }: any) {
           </View>
           <Switch
             value={saveOriginal}
-            onValueChange={setSaveOriginal}
+            onValueChange={handleToggleSaveOriginal}
             trackColor={{ false: theme.switchTrackOff, true: theme.accent }}
             thumbColor="#fff"
           />
@@ -183,7 +193,7 @@ export default function MeScreen({ navigation }: any) {
           { icon: 'help-circle',        color: theme.blue,   bg: theme.blue  + '20', label: 'Trợ giúp & Phản hồi',
             onPress: () => Alert.alert('Trợ giúp', 'Liên hệ nhà phát triển qua email hỗ trợ của dự án.') },
           { icon: 'information-circle', color: '#8e24aa',    bg: '#8e24aa20', label: 'Giới thiệu',
-            onPress: () => Alert.alert('CamScanner Pro', 'Phiên bản: 2.3.0 (Sửa lỗi Lưu/Chia sẻ QR)\n\nMáy quét tài liệu AI đa năng.\n\n© 2026 Developer Team.') },
+            onPress: () => Alert.alert('CamScanner Pro', `Phiên bản: ${Constants.expoConfig?.version || '2.5.0'}\n\nMáy quét tài liệu AI đa năng.\n\n© 2026 Developer Team.`) },
         ].map((item, i) => (
           <TouchableOpacity key={i} style={[s.menuItem, { borderBottomColor: theme.border }]} onPress={item.onPress} activeOpacity={0.6}>
             <View style={[s.menuIconBox, { backgroundColor: item.bg }]}>

@@ -327,7 +327,10 @@ export default function QRGeneratorScreen({ navigation }: any) {
         ? qrDataUrl.split('base64,')[1]
         : qrDataUrl;
 
-      const filename = `QR_${Date.now()}.png`;
+      const isBmp = qrDataUrl.startsWith('data:image/bmp');
+      const ext = isBmp ? 'bmp' : 'png';
+      const mime = isBmp ? 'image/bmp' : 'image/png';
+      const filename = `QR_${Date.now()}.${ext}`;
       const docDir = getDocumentDirectory();
       const fileUri = `${docDir}${filename}`;
 
@@ -338,7 +341,7 @@ export default function QRGeneratorScreen({ navigation }: any) {
       if (await Sharing.isAvailableAsync()) {
         await Sharing.shareAsync(fileUri, {
           dialogTitle: 'Lưu hoặc Chia sẻ Mã QR',
-          mimeType: 'image/png',
+          mimeType: mime,
         });
       } else {
         Alert.alert('✅ Thành công', `Đã lưu ảnh mã QR vào thiết bị:\n${filename}`);

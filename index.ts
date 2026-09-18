@@ -1,9 +1,15 @@
 import { registerRootComponent } from 'expo';
 import { Alert } from 'react-native';
 
-const defaultHandler = (global as any).ErrorUtils?.getGlobalHandler?.();
-(global as any).ErrorUtils?.setGlobalHandler?.((error: any, isFatal: boolean) => {
-  Alert.alert('Fatal JS Error', `${error.name}: ${error.message}\n${error.stack}`);
+const defaultHandler = (globalThis as any).ErrorUtils?.getGlobalHandler?.();
+(globalThis as any).ErrorUtils?.setGlobalHandler?.((error: any, isFatal: boolean) => {
+  console.error('[FATAL JS ERROR]', error?.name, error?.message, error?.stack);
+  const errCode = 'ERR_' + Date.now().toString(36).toUpperCase().slice(-6);
+  if (__DEV__) {
+    Alert.alert('Fatal JS Error (Dev)', `${error?.name}: ${error?.message}\n${error?.stack}`);
+  } else {
+    Alert.alert('Sự cố ứng dụng', `Đã xảy ra lỗi không mong muốn (Mã lỗi: ${errCode}). Vui lòng khởi động lại ứng dụng.`);
+  }
   if (defaultHandler) {
     defaultHandler(error, isFatal);
   }

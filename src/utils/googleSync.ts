@@ -53,7 +53,8 @@ export const signInWithGoogle = async (): Promise<string | null> => {
 };
 
 /**
- * Upload file lên Google Drive
+ * Upload file lên Google Drive bằng Resumable Upload (Stream trực tiếp từ đĩa)
+ * Không nạp Base64 vào RAM, chống OOM crash với tài liệu nhiều trang
  */
 export const uploadToGoogleDrive = async (
   accessToken: string,
@@ -65,71 +66,90 @@ export const uploadToGoogleDrive = async (
   const fileInfo = await FileSystem.getInfoAsync(fileUri);
   if (!fileInfo.exists) throw new Error('File không tồn tại');
 
-  const fileContent = await FileSystem.readAsStringAsync(fileUri, {
-    encoding: FileSystem.EncodingType.Base64,
-  });
-
   const metadata = {
     name: fileName,
     mimeType: isDoc ? 'application/vnd.google-apps.document' : mimeType,
   };
 
-  const boundary = '-------314159265358979323846';
-  const delimiter = '\r\n--' + boundary + '\r\n';
-  const closeDelim = '\r\n--' + boundary + '--';
-
-  const body =
-    delimiter +
-    'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
-    JSON.stringify(metadata) +
-    delimiter +
-    'Content-Type: ' + mimeType + '\r\n' +
-    'Content-Transfer-Encoding: base64\r\n\r\n' +
-    fileContent +
-    closeDelim;
-
-  const res = await fetch(
-    'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
+  // Bước 1: Khởi tạo Resumable Upload Session
+  const sessionRes = await fetch(
+    'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable',
     {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${accessToken}`,
-        'Content-Type': `multipart/related; boundary=${boundary}`,
+        'Content-Type': 'application/json; charset=UTF-8',
+        'X-Upload-Content-Type': mimeType,
       },
-      body,
+      body: JSON.stringify(metadata),
     }
   );
 
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error?.message || 'Lỗi upload Drive');
-  return data;
+  if (!sessionRes.ok) {
+    const errData = await sessionRes.json().catch(() => ({}));
+    throw new Error(errData.error?.message || `Lỗi tạo session Google Drive: HTTP ${sessionRes.status}`);
+  }
+
+  const uploadLocationUrl = sessionRes.headers.get('location') || sessionRes.headers.get('Location');
+  if (!uploadLocationUrl) {
+    throw new Error('Google Drive không trả về URL tải lên (Location header)');
+  }
+
+  // Bước 2: Stream nhị phân trực tiếp từ file đĩa lên Google Drive (Zero JS RAM overhead)
+  const uploadResult = await FileSystem.uploadAsync(uploadLocationUrl, fileUri, {
+    httpMethod: 'PUT',
+    uploadType: FileSystem.FileSystemUploadType.BINARY_CONTENT,
+    headers: {
+      'Content-Type': mimeType,
+    },
+  });
+
+  if (uploadResult.status < 200 || uploadResult.status >= 300) {
+    throw new Error(`Upload lên Google Drive thất bại: HTTP ${uploadResult.status}`);
+  }
+
+  try {
+    return JSON.parse(uploadResult.body);
+  } catch {
+    return { success: true, status: uploadResult.status };
+  }
 };
 
 /**
- * Upload ảnh lên Google Photos
+ * Upload ảnh lên Google Photos bằng Native Binary Stream
+ * Không load Blob vào JS heap, tối ưu bộ nhớ
  */
 export const uploadToGooglePhotos = async (
   accessToken: string,
   imageUri: string,
   fileName: string
 ) => {
-  const fetchResponse = await fetch(imageUri);
-  const blob = await fetchResponse.blob();
+  // Bước 1: Upload nhị phân trực tiếp từ đĩa lấy Upload Token
+  const uploadResult = await FileSystem.uploadAsync(
+    'https://photoslibrary.googleapis.com/v1/uploads',
+    imageUri,
+    {
+      httpMethod: 'POST',
+      uploadType: FileSystem.FileSystemUploadType.BINARY_CONTENT,
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/octet-stream',
+        'X-Goog-Upload-Content-Type': 'image/jpeg',
+        'X-Goog-Upload-Protocol': 'raw',
+      },
+    }
+  );
 
-  const uploadRes = await fetch('https://photoslibrary.googleapis.com/v1/uploads', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/octet-stream',
-      'X-Goog-Upload-Content-Type': 'image/jpeg',
-      'X-Goog-Upload-Protocol': 'raw',
-    },
-    body: blob,
-  });
+  if (uploadResult.status < 200 || uploadResult.status >= 300) {
+    throw new Error(`Lỗi lấy upload token Google Photos: HTTP ${uploadResult.status}`);
+  }
 
-  const uploadToken = await uploadRes.text();
-  if (!uploadRes.ok) throw new Error('Lỗi lấy upload token');
+  const uploadToken = uploadResult.body.trim();
+  if (!uploadToken) {
+    throw new Error('Không nhận được upload token từ Google Photos');
+  }
 
+  // Bước 2: Gắn uploadToken vào media item của người dùng
   const createRes = await fetch(
     'https://photoslibrary.googleapis.com/v1/mediaItems:batchCreate',
     {
@@ -150,6 +170,6 @@ export const uploadToGooglePhotos = async (
   );
 
   const createData = await createRes.json();
-  if (!createRes.ok) throw new Error('Lỗi tạo media item Photos');
+  if (!createRes.ok) throw new Error(createData.error?.message || 'Lỗi tạo media item Photos');
   return createData;
 };
