@@ -1,21 +1,64 @@
 /**
  * fileHelper.ts — Quản lý file an toàn chuẩn Production
- * - Không fallback sang cacheDirectory (chống mất dữ liệu người dùng)
- * - Tự động đánh số tránh ghi đè file cũ
+ * - Tên file được sanitize tuyệt đối (chống path traversal, ký tự cấm, Windows reserved words)
+ * - Tự động đánh số chống ghi đè (file.pdf -> file (1).pdf)
  * - Phân loại thư mục/tập tin bằng FileSystem.getInfoAsync (isDirectory)
- * - Cung cấp model DocumentItem hoàn chỉnh
+ * - Mô hình DocumentItem chuẩn nghiệp vụ
  */
 
 import * as FileSystem from 'expo-file-system/legacy';
+import { DocumentItem } from '../types/domain';
 
-export interface DocumentItem {
-  id: string;
-  name: string;
-  uri: string;
-  isDirectory: boolean;
-  size: number;
-  modificationTime: number;
-  extension: string;
+export { DocumentItem };
+
+// Danh sách các tên tập tin cấm trên hệ điều hành Windows
+const WINDOWS_RESERVED_NAMES = new Set([
+  'CON', 'PRN', 'AUX', 'NUL',
+  'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
+  'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9',
+]);
+
+/**
+ * Chuẩn hóa tên file tuyệt đối an toàn:
+ * - Loại bỏ ký tự cấm: / \ : * ? " < > | và mã điều khiển
+ * - Loại bỏ path traversal: '..'
+ * - Xóa khoảng trắng thừa và dấu chấm ở cuối (Windows không cho phép)
+ * - Xử lý tên cấm Windows (CON, PRN, AUX, NUL...)
+ * - Giữ trọn vẹn chữ cái tiếng Việt có dấu Unicode
+ * - Giới hạn độ dài tối đa 120 ký tự
+ */
+export function sanitizeFileName(rawName: string, fallbackBase: string = 'TaiLieu'): string {
+  if (!rawName) return `${fallbackBase}_${Date.now()}`;
+
+  // 1. Loại bỏ path traversal (..)
+  let clean = rawName.replace(/\.{2,}/g, '.');
+
+  // 2. Loại bỏ các ký tự đặc biệt nguy hiểm và điều khiển (ASCII 0-31)
+  // Chỉ giữ chữ cái (Unicode), số, dấu gạch dưới, gạch ngang, dấu chấm và khoảng trắng
+  clean = clean.replace(/[<>:"/\\|?*\x00-\x1F]/g, '_');
+
+  // 3. Chuẩn hóa khoảng trắng và dấu chấm ở đầu/cuối
+  clean = clean.replace(/\s+/g, ' ').trim();
+  clean = clean.replace(/^\.+/, '').replace(/\.+$/, ''); // Xóa dấu chấm ở đầu và cuối tên
+
+  // 4. Giới hạn độ dài tối đa 120 ký tự
+  if (clean.length > 120) {
+    clean = clean.substring(0, 120).trim();
+  }
+
+  // 5. Kiểm tra nếu rỗng sau khi lọc
+  if (!clean) {
+    clean = `${fallbackBase}_${Date.now()}`;
+  }
+
+  // 6. Kiểm tra Windows Reserved Names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
+  const upper = clean.toUpperCase();
+  const baseWithoutExt = upper.split('.')[0];
+  if (WINDOWS_RESERVED_NAMES.has(baseWithoutExt)) {
+    clean = `${clean}_doc`;
+  }
+
+  return clean;
 }
 
 /**
@@ -23,8 +66,7 @@ export interface DocumentItem {
  * Ném lỗi rõ ràng nếu môi trường không cung cấp, tuyệt đối KHÔNG fallback sang cache.
  */
 export function getDocumentDirectory(): string {
-  const fs = FileSystem as any;
-  const dir = fs.documentDirectory;
+  const dir = FileSystem.documentDirectory;
   if (!dir) {
     throw new Error('Lỗi lưu trữ: Thư mục DocumentDirectory không khả dụng trên thiết bị này.');
   }
@@ -48,11 +90,10 @@ export async function safeMoveFile(from: string, to: string): Promise<void> {
  * Tìm tên file duy nhất chưa bị trùng trong thư mục (vd: file.pdf -> file (1).pdf)
  */
 export async function getUniqueFilePath(dir: string, baseName: string, ext: string): Promise<string> {
-  let cleanName = baseName.replace(/[^\p{L}\p{N}_\-\s]/gu, '_').trim();
-  if (!cleanName) cleanName = 'TaiLieu_' + Date.now();
-
-  const formattedExt = ext.startsWith('.') ? ext : `.${ext}`;
-  let targetUri = `${dir}${cleanName}${formattedExt}`;
+  const cleanBase = sanitizeFileName(baseName, 'TaiLieu');
+  const formattedExt = ext ? (ext.startsWith('.') ? ext : `.${ext}`) : '';
+  
+  let targetUri = `${dir}${cleanBase}${formattedExt}`;
   let counter = 1;
 
   while (true) {
@@ -60,7 +101,7 @@ export async function getUniqueFilePath(dir: string, baseName: string, ext: stri
     if (!info.exists) {
       return targetUri;
     }
-    targetUri = `${dir}${cleanName} (${counter})${formattedExt}`;
+    targetUri = `${dir}${cleanBase} (${counter})${formattedExt}`;
     counter++;
   }
 }
@@ -70,7 +111,7 @@ export async function getUniqueFilePath(dir: string, baseName: string, ext: stri
  */
 export async function savePdfToDocuments(
   tempUri: string,
-  safeName: string,
+  rawName: string,
   subDir: string = ''
 ): Promise<string> {
   const root = getDocumentDirectory();
@@ -82,8 +123,8 @@ export async function savePdfToDocuments(
     await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
   }
 
-  const cleanBaseName = safeName.replace(/\.pdf$/i, '');
-  const targetUri = await getUniqueFilePath(dir, cleanBaseName, '.pdf');
+  const baseName = rawName.replace(/\.pdf$/i, '');
+  const targetUri = await getUniqueFilePath(dir, baseName, '.pdf');
   await safeMoveFile(tempUri, targetUri);
   return targetUri;
 }
@@ -99,6 +140,12 @@ export async function saveBase64ToDocuments(
   const root = getDocumentDirectory();
   const dir = subDir ? `${root}${subDir}/` : root;
 
+  // Đảm bảo thư mục đích tồn tại
+  const dirInfo = await FileSystem.getInfoAsync(dir);
+  if (!dirInfo.exists) {
+    await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
+  }
+
   const lastDot = fileName.lastIndexOf('.');
   const baseName = lastDot !== -1 ? fileName.substring(0, lastDot) : fileName;
   const ext = lastDot !== -1 ? fileName.substring(lastDot) : '';
@@ -111,7 +158,7 @@ export async function saveBase64ToDocuments(
 }
 
 /**
- * Copy file từ ngoài vào documentDirectory an toàn.
+ * Copy file từ ngoài vào documentDirectory an toàn (tự động chống ghi đè).
  */
 export async function copyFileToDocuments(
   sourceUri: string,
@@ -120,6 +167,12 @@ export async function copyFileToDocuments(
 ): Promise<string> {
   const root = getDocumentDirectory();
   const dir = subDir ? `${root}${subDir}/` : root;
+
+  // Đảm bảo thư mục đích tồn tại
+  const dirInfo = await FileSystem.getInfoAsync(dir);
+  if (!dirInfo.exists) {
+    await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
+  }
 
   const lastDot = fileName.lastIndexOf('.');
   const baseName = lastDot !== -1 ? fileName.substring(0, lastDot) : fileName;
@@ -130,12 +183,14 @@ export async function copyFileToDocuments(
   return targetUri;
 }
 
+export const DEFAULT_SUPPORTED_EXTENSIONS = ['.pdf', '.docx', '.xlsx', '.jpg', '.jpeg', '.png', '.txt'];
+
 /**
  * Đọc toàn bộ danh sách tập tin và thư mục kèm metadata chi tiết
  */
 export async function listDocumentItems(
   subDir: string = '',
-  supportedExts: string[] = ['.pdf', '.docx', '.xlsx']
+  supportedExts: string[] = DEFAULT_SUPPORTED_EXTENSIONS
 ): Promise<DocumentItem[]> {
   try {
     const root = getDocumentDirectory();
@@ -191,10 +246,10 @@ export async function listDocumentItems(
 }
 
 /**
- * Hàm tương thích ngược với code cũ: trả về mảng string tên file/folder
+ * Hàm tương thích ngược với code cũ: trả về mảng string tên file
  */
 export async function listDocumentFiles(
-  extensions: string[] = ['.pdf', '.docx', '.xlsx']
+  extensions: string[] = DEFAULT_SUPPORTED_EXTENSIONS
 ): Promise<string[]> {
   const items = await listDocumentItems('', extensions);
   return items.map(item => item.name);

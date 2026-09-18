@@ -2,7 +2,7 @@
   "expo": {
     "name": "camscanner-expo",
     "slug": "camscanner-expo",
-    "version": "2.5.0",
+    "version": "2.6.0",
     "scheme": "camscanner",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -14,7 +14,7 @@
       "vi": "./locales/vi.json"
     },
     "android": {
-      "versionCode": 3,
+      "versionCode": 4,
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",

@@ -84,7 +84,25 @@ function generateBmpQrUrl(
   margin: number = 2
 ): string {
   const QRCode = require('qrcode');
-  const qr = QRCode.create(text, { errorCorrectionLevel: ecc });
+  
+  // Tự động fallback ECC nếu dữ liệu quá dài đối với mức sửa lỗi cao
+  let qr: any;
+  const eccFallbackOrder: Array<'H' | 'Q' | 'M' | 'L'> = ecc === 'H' ? ['H', 'Q', 'M', 'L'] : ecc === 'Q' ? ['Q', 'M', 'L'] : [ecc];
+  
+  let lastErr: any = null;
+  for (const level of eccFallbackOrder) {
+    try {
+      qr = QRCode.create(text, { errorCorrectionLevel: level });
+      break;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+
+  if (!qr) {
+    throw new Error(lastErr?.message || 'Dữ liệu quá dài vượt quá dung lượng tối đa của mã QR.');
+  }
+
   const size = qr.modules.size;
   const data = qr.modules.data;
   const fullSize = size + margin * 2;
@@ -242,9 +260,9 @@ export default function QRGeneratorScreen({ navigation }: any) {
       const url = generateBmpQrUrl(trimmed, selectedColor.fg, selectedColor.bg, ecc);
       setQrDataUrl(url);
       saveToHistory(trimmed, url);
-    } catch (err) {
+    } catch (err: any) {
       console.log('QR generation failed', err);
-      Alert.alert('Lỗi', 'Không thể tạo mã QR cho đoạn văn bản này.');
+      Alert.alert('Không thể tạo QR', err?.message || 'Dữ liệu quá dài hoặc không hợp lệ để tạo mã QR.');
     } finally {
       setIsGenerating(false);
     }

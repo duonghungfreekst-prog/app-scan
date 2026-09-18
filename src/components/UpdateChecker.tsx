@@ -4,24 +4,54 @@ import Constants from 'expo-constants';
 import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../theme';
 
+import Storage from '../utils/storage';
+
 // Thông tin cấu hình GitHub Repository của bạn
 const GITHUB_USERNAME = 'duonghungfreekst-prog';
 const GITHUB_REPO = 'app-scan';
+const LAST_CHECK_KEY = '@camscanner_last_update_check_ts';
+const CHECK_INTERVAL_MS = 60 * 60 * 1000; // Kiểm tra tối đa 1 lần mỗi giờ
 
 const { width } = Dimensions.get('window');
 
-// Hàm so sánh phiên bản (vd: "2.4.0" > "2.3.0")
-const compareVersions = (v1: string, v2: string) => {
-  const parts1 = v1.replace(/[^0-9.]/g, '').split('.').map(Number);
-  const parts2 = v2.replace(/[^0-9.]/g, '').split('.').map(Number);
-  for (let i = 0; i < Math.max(parts1.length, parts2.length); i++) {
-    const p1 = parts1[i] || 0;
-    const p2 = parts2[i] || 0;
-    if (p1 > p2) return 1;
-    if (p1 < p2) return -1;
+export interface SemVer {
+  major: number;
+  minor: number;
+  patch: number;
+  prerelease?: string;
+}
+
+export function parseSemVer(v: string): SemVer {
+  const clean = (v || '').trim().replace(/^v/i, '');
+  const [mainPart, prePart] = clean.split('-');
+  const [buildClean] = (prePart || '').split('+');
+  const [major = 0, minor = 0, patch = 0] = mainPart.split('.').map(num => parseInt(num, 10) || 0);
+
+  return {
+    major,
+    minor,
+    patch,
+    prerelease: buildClean || undefined,
+  };
+}
+
+export function compareSemVer(v1: string, v2: string): number {
+  const sem1 = parseSemVer(v1);
+  const sem2 = parseSemVer(v2);
+
+  if (sem1.major !== sem2.major) return sem1.major > sem2.major ? 1 : -1;
+  if (sem1.minor !== sem2.minor) return sem1.minor > sem2.minor ? 1 : -1;
+  if (sem1.patch !== sem2.patch) return sem1.patch > sem2.patch ? 1 : -1;
+
+  // Bản chính thức (không có prerelease) lớn hơn bản prerelease
+  if (!sem1.prerelease && sem2.prerelease) return 1;
+  if (sem1.prerelease && !sem2.prerelease) return -1;
+  if (sem1.prerelease && sem2.prerelease) {
+    return sem1.prerelease.localeCompare(sem2.prerelease);
   }
+
   return 0;
-};
+}
 
 export default function UpdateChecker() {
   const [updateInfo, setUpdateInfo] = useState<{ hasUpdate: boolean; newVersion: string; downloadUrl: string; releaseNotes: string } | null>(null);
@@ -33,7 +63,15 @@ export default function UpdateChecker() {
 
   const checkUpdate = async () => {
     try {
-      if ((GITHUB_USERNAME as string) === 'YOUR_GITHUB_USERNAME') return; // Chưa cấu hình thì bỏ qua
+      if ((GITHUB_USERNAME as string) === 'YOUR_GITHUB_USERNAME') return;
+
+      // Rate limit check: tối đa 1 lần mỗi giờ để tránh cạn kiệt GitHub API rate limit
+      const lastCheckStr = await Storage.getItem(LAST_CHECK_KEY);
+      const lastCheck = lastCheckStr ? parseInt(lastCheckStr, 10) : 0;
+      const now = Date.now();
+      if (now - lastCheck < CHECK_INTERVAL_MS) {
+        return; // Bỏ qua nếu vừa kiểm tra gần đây
+      }
 
       const currentVersion = Constants.expoConfig?.version || '1.0.0';
       const apiUrl = `https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO}/releases/latest`;
@@ -53,10 +91,13 @@ export default function UpdateChecker() {
         
         if (!response.ok) return;
         
+        // Cập nhật timestamp lần kiểm tra thành công
+        await Storage.setItem(LAST_CHECK_KEY, String(now));
+
         const data = await response.json();
-        const latestVersion = data.tag_name; // Ví dụ: "v2.4.0" hoặc "2.4.0"
+        const latestVersion = data.tag_name; // Ví dụ: "v2.5.0"
         
-        if (compareVersions(latestVersion, currentVersion) > 0) {
+        if (compareSemVer(latestVersion, currentVersion) > 0) {
           // Ưu tiên tìm file .apk trong assets, nếu không thì dẫn tới trang tải HTML
           let downloadUrl = data.html_url;
           if (data.assets && data.assets.length > 0) {

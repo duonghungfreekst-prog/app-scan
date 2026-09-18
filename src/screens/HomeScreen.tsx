@@ -2,35 +2,37 @@ import React, { useState, useCallback } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, ScrollView, Alert } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import * as FileSystem from 'expo-file-system/legacy';
-import { getDocumentDirectory, listDocumentFiles } from '../utils/fileHelper';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { CompositeNavigationProp } from '@react-navigation/native';
+import { BottomTabNavigationProp } from '@react-navigation/bottom-tabs';
+import { RootStackParamList, MainTabParamList } from '../types/navigation';
+import { getDocumentDirectory, listDocumentItems, DEFAULT_SUPPORTED_EXTENSIONS } from '../utils/fileHelper';
 import * as Sharing from 'expo-sharing';
 import { useFocusEffect } from '@react-navigation/native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useTheme } from '../theme';
 
-export default function HomeScreen({ navigation }: any) {
+type HomeScreenNavigationProp = CompositeNavigationProp<
+  BottomTabNavigationProp<MainTabParamList, 'Home'>,
+  NativeStackNavigationProp<RootStackParamList>
+>;
+
+interface HomeScreenProps {
+  navigation: HomeScreenNavigationProp;
+}
+
+export default function HomeScreen({ navigation }: HomeScreenProps) {
   const { theme } = useTheme();
   const [recentFiles, setRecentFiles] = useState<string[]>([]);
 
   const loadRecentFiles = async () => {
     try {
-      const docDir = getDocumentDirectory();
-      const docs = await listDocumentFiles(['.pdf', '.docx', '.xlsx']);
-      // Sort theo thời gian chỉnh sửa mới nhất (mới nhất trước)
-      const withMeta = await Promise.all(
-        docs.map(async (f) => {
-          try {
-            const info = await FileSystem.getInfoAsync(docDir + f);
-            return { name: f, modTime: (info as any).modificationTime ?? 0 };
-          } catch {
-            return { name: f, modTime: 0 };
-          }
-        })
-      );
-      withMeta.sort((a, b) => b.modTime - a.modTime);
-      setRecentFiles(withMeta.slice(0, 3).map(m => m.name));
+      const items = await listDocumentItems('', DEFAULT_SUPPORTED_EXTENSIONS);
+      // Chỉ lấy các tập tin (không phải thư mục) và lấy 3 file gần nhất
+      const filesOnly = items.filter(it => !it.isDirectory).slice(0, 3);
+      setRecentFiles(filesOnly.map(m => m.name));
     } catch (e) {
-      console.log('[UI] Error reading docs', e);
+      console.warn('[HomeScreen] Error reading docs', e);
     }
   };
 
@@ -39,23 +41,45 @@ export default function HomeScreen({ navigation }: any) {
   const handleSmartScan = () => navigation.navigate('Scanner', { autoScan: true });
   const handleTriggerTool = (actionName: string) => navigation.navigate('Tools', { triggerAction: actionName });
 
+  const handleOpenFile = async (fileName: string) => {
+    try {
+      const uri = getDocumentDirectory() + fileName;
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(uri, {
+          dialogTitle: `Mở tài liệu: ${fileName}`,
+          mimeType: fileName.endsWith('.pdf')
+            ? 'application/pdf'
+            : fileName.endsWith('.docx')
+            ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            : fileName.endsWith('.xlsx')
+            ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            : undefined,
+        });
+      }
+    } catch {
+      Alert.alert('Lỗi', 'Không thể mở tài liệu');
+    }
+  };
+
   const handleShareFile = async (fileName: string) => {
     try {
       const uri = getDocumentDirectory() + fileName;
-      if (await Sharing.isAvailableAsync()) await Sharing.shareAsync(uri);
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(uri, { dialogTitle: `Chia sẻ tài liệu: ${fileName}` });
+      }
     } catch {
       Alert.alert('Lỗi', 'Không thể chia sẻ file');
     }
   };
 
   const tools = [
-    { action: () => handleSmartScan(),               icon: 'scan',          bg: '#00e5cc22', color: theme.accent,    label: 'Quét Thường' },
-    { action: () => navigation.navigate('QRScanner'),icon: 'qr-code',       bg: '#ffb30022', color: theme.warn,      label: 'Quét QR' },
-    { action: () => navigation.navigate('QRGenerator'),icon: 'create',      bg: '#7c3aed22', color: '#7c3aed',       label: 'Tạo QR' },
-    { action: () => handleTriggerTool('pdfTools'),   icon: 'document-text', bg: '#ff525222', color: theme.danger,    label: 'Gộp PDF' },
-    { action: () => handleTriggerTool('importImages'),icon: 'images',       bg: '#64b5f622', color: theme.blue,      label: 'Nhập Ảnh' },
-    { action: () => handleTriggerTool('idCard'),      icon: 'card',         bg: '#1e88e522', color: theme.blue,      label: 'Thẻ ID' },
-    { action: () => handleTriggerTool('ocr'),         icon: 'text',         bg: '#43a04722', color: theme.green,     label: 'Nhận diện chữ' },
+    { action: () => handleSmartScan(),                icon: 'scan',          bg: '#00e5cc22', color: theme.accent,    label: 'Quét Thường' },
+    { action: () => navigation.navigate('QRScanner'), icon: 'qr-code',       bg: '#ffb30022', color: theme.warn,      label: 'Quét QR' },
+    { action: () => navigation.navigate('QRGenerator'),icon: 'create',       bg: '#7c3aed22', color: '#7c3aed',       label: 'Tạo QR' },
+    { action: () => handleTriggerTool('pdfTools'),    icon: 'document-text', bg: '#ff525222', color: theme.danger,    label: 'Gộp PDF' },
+    { action: () => handleTriggerTool('importImages'), icon: 'images',        bg: '#64b5f622', color: theme.blue,      label: 'Nhập Ảnh' },
+    { action: () => handleTriggerTool('idCard'),       icon: 'card',          bg: '#1e88e522', color: theme.blue,      label: 'Thẻ ID' },
+    { action: () => handleTriggerTool('ocr'),          icon: 'text',          bg: '#43a04722', color: theme.green,     label: 'Nhận diện chữ' },
   ];
 
   return (
@@ -68,11 +92,11 @@ export default function HomeScreen({ navigation }: any) {
         <View style={s.headerInner}>
           <View>
             <Text style={s.headerGreet}>Xin chào 👋</Text>
-            <Text style={s.headerTitle}>CamScanner Pro</Text>
+            <Text style={s.headerTitle}>CamScanner</Text>
           </View>
           <View style={s.premiumBadge}>
-            <Ionicons name="ribbon" size={16} color="#ffd700" />
-            <Text style={s.premiumText}>PRO</Text>
+            <Ionicons name="shield-checkmark" size={14} color="#00e5cc" />
+            <Text style={s.premiumText}>v2.5.0</Text>
           </View>
         </View>
       </LinearGradient>
@@ -101,7 +125,12 @@ export default function HomeScreen({ navigation }: any) {
             const iconName = file.endsWith('.docx') ? 'document-text' : file.endsWith('.xlsx') ? 'stats-chart' : 'document';
             const iconColor = file.endsWith('.docx') ? theme.blue : file.endsWith('.xlsx') ? theme.green : theme.warn;
             return (
-              <View key={idx} style={[s.recentFileItem, { backgroundColor: theme.card, borderColor: theme.border }]}>
+              <TouchableOpacity
+                key={idx}
+                style={[s.recentFileItem, { backgroundColor: theme.card, borderColor: theme.border }]}
+                onPress={() => handleOpenFile(file)}
+                activeOpacity={0.7}
+              >
                 <View style={[s.fileIconBg, { backgroundColor: iconColor + '22' }]}>
                   <Ionicons name={iconName as any} size={22} color={iconColor} />
                 </View>
@@ -114,7 +143,7 @@ export default function HomeScreen({ navigation }: any) {
                 <TouchableOpacity onPress={() => handleShareFile(file)} style={[s.shareBtn, { backgroundColor: theme.surface }]}>
                   <Ionicons name="share-social" size={18} color={theme.blue} />
                 </TouchableOpacity>
-              </View>
+              </TouchableOpacity>
             );
           })
         )}

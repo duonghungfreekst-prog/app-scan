@@ -21,8 +21,12 @@ export const SecureStorage = {
         keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
       });
     } catch (e) {
-      console.warn('[SecureStore] Failed to write securely, fallback to standard storage', e);
-      await Storage.setItem(key, value);
+      console.error('[SecureStore] Failed to write securely to Hardware Keystore/Keychain:', e);
+      if (Platform.OS === 'web') {
+        await Storage.setItem(key, value);
+        return;
+      }
+      throw new Error('Lỗi bảo mật: Không thể ghi dữ liệu an toàn vào Hardware Keystore/Keychain của thiết bị.');
     }
   },
 
@@ -41,14 +45,21 @@ export const SecureStorage = {
       const legacyVal = await Storage.getItem(key);
       if (legacyVal) {
         // Tự động migrate sang SecureStore và xóa ở legacy storage
-        await this.setItem(key, legacyVal);
-        await Storage.removeItem(key);
+        try {
+          await this.setItem(key, legacyVal);
+          await Storage.removeItem(key);
+        } catch {
+          // Bỏ qua lỗi migrate nếu Keystore tạm thời khóa
+        }
         return legacyVal;
       }
       return null;
     } catch (e) {
-      console.warn('[SecureStore] Failed to read securely, fallback to standard storage', e);
-      return await Storage.getItem(key);
+      console.warn('[SecureStore] Failed to read from secure store:', e);
+      if (Platform.OS === 'web') {
+        return await Storage.getItem(key);
+      }
+      return null;
     }
   },
 

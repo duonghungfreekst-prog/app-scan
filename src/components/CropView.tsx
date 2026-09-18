@@ -1,17 +1,18 @@
 import React, { useRef, useState } from 'react';
-import { View, StyleSheet, PanResponder, Image, Dimensions, TouchableOpacity, Text } from 'react-native';
+import { View, StyleSheet, PanResponder, Image, Dimensions, TouchableOpacity, Text, Alert } from 'react-native';
+import { CropPoint, PolygonCorners } from '../types/domain';
+
+export type Point = CropPoint;
 
 const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get('window');
 const HEADER_H = 80;
 const MAX_IMG_W = SCREEN_W - 40;
 const MAX_IMG_H = SCREEN_H - HEADER_H - 120;
 
-export type Point = { x: number; y: number };
-
 export interface CropViewProps {
   imageUri: string;
-  initialCorners?: [Point, Point, Point, Point]; // TL, TR, BL, BR
-  onCropSave: (corners: [Point, Point, Point, Point], imgDisplaySize: { w: number, h: number }) => void;
+  initialCorners?: PolygonCorners; // TL (0), TR (1), BL (2), BR (3)
+  onCropSave: (corners: PolygonCorners, imgDisplaySize: { w: number, h: number }) => void;
   onCancel: () => void;
 }
 
@@ -39,11 +40,78 @@ const Line = ({ p1, p2 }: { p1: Point, p2: Point }) => {
   );
 };
 
+/**
+ * Kiểm tra tính hợp lệ của tứ giác cắt viền:
+ * 1. Không tự cắt nhau và phải là đa giác lồi (Convex Polygon)
+ * 2. Chiều dài mỗi cạnh tối thiểu 30px
+ * 3. Diện tích tối thiểu >= 5% khung hình hiển thị
+ */
+export function validateCropPolygon(
+  corners: PolygonCorners,
+  displayWidth: number,
+  displayHeight: number
+): { valid: boolean; message?: string } {
+  // Thứ tự theo chiều kim đồng hồ: 0 (TL) -> 1 (TR) -> 3 (BR) -> 2 (BL)
+  const p = [corners[0], corners[1], corners[3], corners[2]];
+
+  // 1. Kiểm tra độ dài cạnh
+  const minEdge = 30;
+  for (let i = 0; i < 4; i++) {
+    const next = (i + 1) % 4;
+    const dist = Math.hypot(p[next].x - p[i].x, p[next].y - p[i].y);
+    if (dist < minEdge) {
+      return { valid: false, message: 'Cạnh của vùng chọn quá ngắn. Vui lòng mở rộng 4 góc.' };
+    }
+  }
+
+  // 2. Kiểm tra tính lồi và không tự cắt qua tích có hướng (Cross Products)
+  let prevSign = 0;
+  for (let i = 0; i < 4; i++) {
+    const p1 = p[i];
+    const p2 = p[(i + 1) % 4];
+    const p3 = p[(i + 2) % 4];
+
+    const dx1 = p2.x - p1.x;
+    const dy1 = p2.y - p1.y;
+    const dx2 = p3.x - p2.x;
+    const dy2 = p3.y - p2.y;
+
+    const crossProduct = dx1 * dy2 - dy1 * dx2;
+    if (Math.abs(crossProduct) < 1e-4) {
+      return { valid: false, message: 'Các điểm nằm trên cùng một đường thẳng. Vui lòng kéo rộng các góc.' };
+    }
+
+    const currentSign = crossProduct > 0 ? 1 : -1;
+    if (prevSign === 0) {
+      prevSign = currentSign;
+    } else if (currentSign !== prevSign) {
+      return { valid: false, message: 'Vùng chọn bị xoắn hoặc tự cắt nhau. Vui lòng chỉnh lại 4 góc thành tứ giác lồi.' };
+    }
+  }
+
+  // 3. Kiểm tra diện tích tối thiểu (Shoelace formula)
+  let area = 0;
+  for (let i = 0; i < 4; i++) {
+    const j = (i + 1) % 4;
+    area += p[i].x * p[j].y - p[j].x * p[i].y;
+  }
+  area = Math.abs(area) / 2;
+
+  const minArea = displayWidth * displayHeight * 0.05;
+  if (area < minArea) {
+    return { valid: false, message: 'Diện tích vùng chọn quá nhỏ (dưới 5% tài liệu).' };
+  }
+
+  return { valid: true };
+}
+
 export default function CropView({ imageUri, initialCorners, onCropSave, onCancel }: CropViewProps) {
   const [displaySize, setDisplaySize] = useState({ w: MAX_IMG_W, h: MAX_IMG_H });
+  const displaySizeRef = useRef(displaySize);
+  displaySizeRef.current = displaySize;
   
   // 0: TL, 1: TR, 2: BL, 3: BR
-  const [corners, setCorners] = useState<[Point, Point, Point, Point]>(
+  const [corners, setCorners] = useState<PolygonCorners>(
     initialCorners || [
       { x: 40, y: 40 },
       { x: MAX_IMG_W - 40, y: 40 },
@@ -57,7 +125,9 @@ export default function CropView({ imageUri, initialCorners, onCropSave, onCance
       const ratio = Math.min(MAX_IMG_W / w, MAX_IMG_H / h);
       const dispW = w * ratio;
       const dispH = h * ratio;
-      setDisplaySize({ w: dispW, h: dispH });
+      const newSize = { w: dispW, h: dispH };
+      setDisplaySize(newSize);
+      displaySizeRef.current = newSize;
       
       if (!initialCorners) {
         setCorners([
@@ -84,12 +154,14 @@ export default function CropView({ imageUri, initialCorners, onCropSave, onCance
       },
       onPanResponderMove: (_, gesture) => {
         setCorners(prev => {
-          const newCorners = [...prev] as [Point, Point, Point, Point];
+          const newCorners = [...prev] as PolygonCorners;
           let nx = startX + gesture.dx;
           let ny = startY + gesture.dy;
           
-          nx = Math.max(0, Math.min(nx, displaySize.w));
-          ny = Math.max(0, Math.min(ny, displaySize.h));
+          const maxW = displaySizeRef.current.w;
+          const maxH = displaySizeRef.current.h;
+          nx = Math.max(0, Math.min(nx, maxW));
+          ny = Math.max(0, Math.min(ny, maxH));
 
           newCorners[index] = { x: nx, y: ny };
           return newCorners;
@@ -104,6 +176,15 @@ export default function CropView({ imageUri, initialCorners, onCropSave, onCance
   const pan3 = useRef(createPanResponder(3)).current;
   const pans = [pan0, pan1, pan2, pan3];
 
+  const handleSaveCorners = () => {
+    const check = validateCropPolygon(corners, displaySize.w, displaySize.h);
+    if (!check.valid) {
+      Alert.alert('Căn lề không hợp lệ', check.message || 'Vui lòng kiểm tra lại 4 góc.');
+      return;
+    }
+    onCropSave(corners, displaySize);
+  };
+
   return (
     <View style={styles.container}>
       <View style={styles.header}>
@@ -111,63 +192,79 @@ export default function CropView({ imageUri, initialCorners, onCropSave, onCance
           <Text style={styles.btnText}>Hủy</Text>
         </TouchableOpacity>
         <Text style={styles.title}>Căn chỉnh viền</Text>
-        <TouchableOpacity style={styles.btn} onPress={() => onCropSave(corners, displaySize)}>
+        <TouchableOpacity style={styles.btn} onPress={handleSaveCorners}>
           <Text style={[styles.btnText, { color: '#00bfa5', fontWeight: 'bold' }]}>Xong</Text>
         </TouchableOpacity>
       </View>
 
       <View style={styles.workspace}>
         <View style={{ width: displaySize.w, height: displaySize.h, position: 'relative' }}>
-          <Image source={{ uri: imageUri }} style={{ width: '100%', height: '100%' }} resizeMode="contain" />
-          
-          <View style={{ ...StyleSheet.absoluteFill, backgroundColor: 'rgba(0,0,0,0.3)' }} />
-          
-          {/* Lines */}
+          <Image
+            source={{ uri: imageUri }}
+            style={{ width: displaySize.w, height: displaySize.h }}
+            resizeMode="contain"
+          />
+
+          {/* 4 lines connecting corners */}
           <Line p1={corners[0]} p2={corners[1]} />
           <Line p1={corners[1]} p2={corners[3]} />
           <Line p1={corners[3]} p2={corners[2]} />
           <Line p1={corners[2]} p2={corners[0]} />
 
-          {/* Knobs */}
-          {corners.map((p, i) => (
+          {/* 4 Draggable Corner Knobs */}
+          {corners.map((c, i) => (
             <View
               key={i}
               {...pans[i].panHandlers}
               style={[
                 styles.knob,
-                { left: p.x - KNOB_SIZE / 2, top: p.y - KNOB_SIZE / 2 }
+                {
+                  left: c.x - KNOB_SIZE / 2,
+                  top: c.y - KNOB_SIZE / 2,
+                },
               ]}
             >
-              <View style={styles.knobInner} />
+              <View style={styles.innerDot} />
             </View>
           ))}
         </View>
       </View>
-      <Text style={styles.hint}>Kéo thả 4 góc để chọn phần giấy</Text>
+      <View style={styles.footerTip}>
+        <Text style={styles.tipText}>💡 Kéo 4 chấm tròn màu xanh để căn sát viền mép tài liệu</Text>
+      </View>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
   container: {
-    flex: 1,
-    backgroundColor: '#000',
-    position: 'absolute',
-    top: 0, left: 0, right: 0, bottom: 0,
-    zIndex: 100,
+    ...StyleSheet.absoluteFill,
+    backgroundColor: '#121212',
+    zIndex: 9999,
   },
   header: {
     height: HEADER_H,
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'flex-end',
+    paddingTop: 36,
     paddingHorizontal: 16,
-    paddingBottom: 16,
-    backgroundColor: '#111',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#1e1e1e',
+    borderBottomWidth: 1,
+    borderBottomColor: '#2a2a2a',
   },
-  title: { color: '#fff', fontSize: 17, fontWeight: 'bold' },
-  btn: { padding: 8 },
-  btnText: { color: '#fff', fontSize: 16 },
+  title: {
+    color: '#ffffff',
+    fontSize: 18,
+    fontWeight: 'bold',
+  },
+  btn: {
+    padding: 8,
+  },
+  btnText: {
+    color: '#ffffff',
+    fontSize: 16,
+  },
   workspace: {
     flex: 1,
     justifyContent: 'center',
@@ -177,24 +274,26 @@ const styles = StyleSheet.create({
     position: 'absolute',
     width: KNOB_SIZE,
     height: KNOB_SIZE,
+    borderRadius: KNOB_SIZE / 2,
+    backgroundColor: 'rgba(0, 191, 165, 0.35)',
     justifyContent: 'center',
     alignItems: 'center',
-    backgroundColor: 'rgba(0, 191, 165, 0.3)',
-    borderRadius: KNOB_SIZE / 2,
     zIndex: 10,
   },
-  knobInner: {
-    width: 14,
-    height: 14,
-    borderRadius: 7,
-    backgroundColor: '#00bfa5',
-    borderWidth: 2,
-    borderColor: '#fff',
+  innerDot: {
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    backgroundColor: '#ffffff',
+    borderWidth: 3,
+    borderColor: '#00bfa5',
   },
-  hint: {
-    color: '#ccc',
-    textAlign: 'center',
-    marginBottom: 40,
-    fontSize: 14
-  }
+  footerTip: {
+    paddingBottom: 24,
+    alignItems: 'center',
+  },
+  tipText: {
+    color: '#aaaaaa',
+    fontSize: 13,
+  },
 });

@@ -14,9 +14,10 @@ import ScannerScreen from './src/screens/ScannerScreen';
 import QRScannerScreen from './src/screens/QRScannerScreen';
 import QRGeneratorScreen from './src/screens/QRGeneratorScreen';
 import { ThemeProvider, useTheme } from './src/theme';
+import { MainTabParamList, RootStackParamList } from './src/types/navigation';
 
-const Tab = createBottomTabNavigator();
-const Stack = createNativeStackNavigator();
+const Tab = createBottomTabNavigator<MainTabParamList>();
+const Stack = createNativeStackNavigator<RootStackParamList>();
 
 function TabNavigator() {
   const { theme } = useTheme();

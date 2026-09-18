@@ -1,20 +1,16 @@
 /**
- * Document Image Processing Engine Pro
- * - Gradient-based edge detection để tìm chính xác 4 góc tờ giấy
- * - Perspective Warp thực (homography / projective transform) để nắn thẳng hình thang méo
- * - Book Spine Polynomial Dewarp cho tờ giấy cong gáy sách
- * - Magic Paper enhancement: làm trắng nền, làm đậm chữ, giữ màu con dấu/chữ ký
+ * imageProcessor.ts — Document Image Processing Engine
+ * - Perspective Warp (Projective Transform / Homography) nắn góc
+ * - Tách bạch rõ ràng: Scan thường (Flat scan) vs Scan sách (Book mode)
+ * - Khắc phục hoàn toàn lỗi Dewarp sách làm méo scan tài liệu thông thường
+ * - Khử bóng mờ thích ứng (Adaptive Background Normalization)
+ * - Tinh chỉnh Magic Paper & B&W adaptive bảo vệ nét chữ chì, chữ xám và con dấu
  */
 
-export type FilterMode = 'magic' | 'bw' | 'grayscale' | 'original';
+import { FilterMode, ImageProcessingOptions } from '../types/domain';
+import { IMAGE_PROCESSING_CONFIG } from '../constants/config';
 
-export interface ImageProcessingOptions {
-  filterMode: FilterMode;
-  brightness?: number;
-  contrast?: number;
-  trimMarginPercent?: number;
-  enablePerspectiveWarp?: boolean;
-}
+export { FilterMode, ImageProcessingOptions };
 
 /**
  * Trả về đoạn code JavaScript xử lý ảnh trên HTML5 Canvas
@@ -23,218 +19,25 @@ export interface ImageProcessingOptions {
 export const getCanvasProcessingScript = (): string => {
   return `
     /* =====================================================================
-       STEP 1: GRADIENT-BASED EDGE DETECTION (Sobel) + CORNER FINDER
+       1. PERSPECTIVE WARP (Projective Transform / Homography)
        ===================================================================== */
-
-    function buildSobelEdgeMap(data, W, H) {
-      // Xây dựng grayscale luminance map
-      const gray = new Float32Array(W * H);
-      for (let i = 0; i < W * H; i++) {
-        const idx = i * 4;
-        gray[i] = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
-      }
-
-      // Gaussian blur nhẹ 3x3 để giảm noise
-      const blurred = new Float32Array(W * H);
-      const kernel = [1,2,1, 2,4,2, 1,2,1];
-      for (let y = 1; y < H - 1; y++) {
-        for (let x = 1; x < W - 1; x++) {
-          let sum = 0;
-          let k = 0;
-          for (let dy = -1; dy <= 1; dy++) {
-            for (let dx = -1; dx <= 1; dx++) {
-              sum += gray[(y + dy) * W + (x + dx)] * kernel[k++];
-            }
-          }
-          blurred[y * W + x] = sum / 16;
-        }
-      }
-
-      // Sobel gradient magnitude
-      const edge = new Float32Array(W * H);
-      let maxEdge = 0;
-      for (let y = 1; y < H - 1; y++) {
-        for (let x = 1; x < W - 1; x++) {
-          const gx =
-            -blurred[(y-1)*W+(x-1)] - 2*blurred[y*W+(x-1)] - blurred[(y+1)*W+(x-1)]
-            +blurred[(y-1)*W+(x+1)] + 2*blurred[y*W+(x+1)] + blurred[(y+1)*W+(x+1)];
-          const gy =
-            -blurred[(y-1)*W+(x-1)] - 2*blurred[(y-1)*W+x] - blurred[(y-1)*W+(x+1)]
-            +blurred[(y+1)*W+(x-1)] + 2*blurred[(y+1)*W+x] + blurred[(y+1)*W+(x+1)];
-          const mag = Math.sqrt(gx*gx + gy*gy);
-          edge[y * W + x] = mag;
-          if (mag > maxEdge) maxEdge = mag;
-        }
-      }
-
-      // Normalize 0-255
-      const threshold = maxEdge * 0.18;
-      const result = new Uint8Array(W * H);
-      for (let i = 0; i < W * H; i++) {
-        result[i] = edge[i] > threshold ? 255 : 0;
-      }
-      return result;
-    }
-
-    /* =====================================================================
-       STEP 2: TÌM 4 GÓC TỜ GIẤY (Hough-like line accumulator + corner candidates)
-       ===================================================================== */
-
-    function findDocumentCorners(data, W, H) {
-      const edgeMap = buildSobelEdgeMap(data, W, H);
-
-      // Chia ảnh thành 4 vùng (quadrants) và tìm điểm edge xa nhất từ tâm trong mỗi vùng
-      const cx = W / 2;
-      const cy = H / 2;
-
-      // Mỗi góc: tìm điểm edge trong quadrant có khoảng cách tối đa từ tâm
-      // TL = x < cx, y < cy | TR = x > cx, y < cy
-      // BL = x < cx, y > cy | BR = x > cx, y > cy
-
-      let corners = [
-        { x: W * 0.05, y: H * 0.05 },   // TL
-        { x: W * 0.95, y: H * 0.05 },   // TR
-        { x: W * 0.05, y: H * 0.95 },   // BL
-        { x: W * 0.95, y: H * 0.95 },   // BR
-      ];
-
-      // Margin để tránh detect border ảnh chính nó
-      const mx = Math.floor(W * 0.03);
-      const my = Math.floor(H * 0.03);
-
-      // Tìm điểm edge tốt nhất trong mỗi quadrant theo scoring (gần góc + là edge mạnh)
-      let bestScores = [0, 0, 0, 0];
-
-      // Chỉ sample thưa để nhanh
-      const stepX = Math.max(1, Math.floor(W / 120));
-      const stepY = Math.max(1, Math.floor(H / 120));
-
-      for (let y = my; y < H - my; y += stepY) {
-        for (let x = mx; x < W - mx; x += stepX) {
-          if (edgeMap[y * W + x] === 0) continue;
-
-          const isLeft = x < cx;
-          const isTop = y < cy;
-          const qi = isTop ? (isLeft ? 0 : 1) : (isLeft ? 2 : 3);
-
-          // Score = khoảng cách từ tâm (chuẩn hóa)
-          const dx = (x - cx) / cx;
-          const dy = (y - cy) / cy;
-          const score = dx * dx + dy * dy;
-
-          if (score > bestScores[qi]) {
-            bestScores[qi] = score;
-            corners[qi] = { x, y };
-          }
-        }
-      }
-
-      // Sanity check: nếu 4 góc tạo thành vùng quá nhỏ thì dùng bounding full
-      const minW = (Math.min(corners[1].x, corners[3].x) - Math.max(corners[0].x, corners[2].x));
-      const minH = (Math.min(corners[2].y, corners[3].y) - Math.max(corners[0].y, corners[1].y));
-
-      if (minW < W * 0.3 || minH < H * 0.3) {
-        // Fallback: dùng luminance-based boundary (phương án cũ bảo thủ hơn)
-        corners = detectPaperBoundaryFallback(data, W, H);
-      }
-
-      return corners; // [TL, TR, BL, BR]
-    }
-
-    function detectPaperBoundaryFallback(data, W, H) {
-      let minX = 0, maxX = W - 1, minY = 0, maxY = H - 1;
-
-      // Scan từng cạnh: tìm hàng đầu tiên có > 25% pixel sáng
-      for (let y = 0; y < Math.floor(H * 0.45); y++) {
-        let light = 0, total = 0;
-        for (let x = Math.floor(W * 0.1); x < Math.floor(W * 0.9); x += 3) {
-          const idx = (y * W + x) * 4;
-          if (0.299 * data[idx] + 0.587 * data[idx+1] + 0.114 * data[idx+2] > 90) light++;
-          total++;
-        }
-        if (total > 0 && light / total > 0.25) { minY = y; break; }
-      }
-
-      for (let y = H - 1; y > Math.floor(H * 0.55); y--) {
-        let light = 0, total = 0;
-        for (let x = Math.floor(W * 0.1); x < Math.floor(W * 0.9); x += 3) {
-          const idx = (y * W + x) * 4;
-          if (0.299 * data[idx] + 0.587 * data[idx+1] + 0.114 * data[idx+2] > 90) light++;
-          total++;
-        }
-        if (total > 0 && light / total > 0.25) { maxY = y; break; }
-      }
-
-      for (let x = 0; x < Math.floor(W * 0.4); x++) {
-        let light = 0, total = 0;
-        for (let y = Math.floor(H * 0.1); y < Math.floor(H * 0.9); y += 3) {
-          const idx = (y * W + x) * 4;
-          if (0.299 * data[idx] + 0.587 * data[idx+1] + 0.114 * data[idx+2] > 90) light++;
-          total++;
-        }
-        if (total > 0 && light / total > 0.25) { minX = x; break; }
-      }
-
-      for (let x = W - 1; x > Math.floor(W * 0.6); x--) {
-        let light = 0, total = 0;
-        for (let y = Math.floor(H * 0.1); y < Math.floor(H * 0.9); y += 3) {
-          const idx = (y * W + x) * 4;
-          if (0.299 * data[idx] + 0.587 * data[idx+1] + 0.114 * data[idx+2] > 90) light++;
-          total++;
-        }
-        if (total > 0 && light / total > 0.25) { maxX = x; break; }
-      }
-
-      // Nới lề 1.5%
-      const px = Math.round(W * 0.015), py = Math.round(H * 0.015);
-      minX = Math.max(0, minX - px);
-      maxX = Math.min(W - 1, maxX + px);
-      minY = Math.max(0, minY - py);
-      maxY = Math.min(H - 1, maxY + py);
-
-      return [
-        { x: minX, y: minY },
-        { x: maxX, y: minY },
-        { x: minX, y: maxY },
-        { x: maxX, y: maxY },
-      ];
-    }
-
-    /* =====================================================================
-       STEP 3: PERSPECTIVE WARP (Projective Transform / Homography)
-       Nắn 4 góc méo bất kỳ → hình chữ nhật chuẩn A4
-       Dùng bilinear inverse sampling để tránh aliasing
-       ===================================================================== */
-
-    /**
-     * Giải hệ phương trình tìm homography matrix H (3x3) từ 4 cặp điểm src→dst
-     * Dùng phương pháp Direct Linear Transform (DLT)
-     */
     function computeHomography(srcPts, dstPts) {
-      // srcPts, dstPts: mảng 4 phần tử, mỗi phần tử {x, y}
-      // Xây dựng ma trận A (8x8) để giải Ah = 0
       const A = [];
       for (let i = 0; i < 4; i++) {
-        const { x: sx, y: sy } = srcPts[i];
-        const { x: dx, y: dy } = dstPts[i];
+        const sx = srcPts[i].x, sy = srcPts[i].y;
+        const dx = dstPts[i].x, dy = dstPts[i].y;
         A.push([-sx, -sy, -1, 0, 0, 0, dx * sx, dx * sy, dx]);
         A.push([0, 0, 0, -sx, -sy, -1, dy * sx, dy * sy, dy]);
       }
 
-      // Giải bằng Gaussian elimination để tìm h (vector 9 phần tử)
-      // Rút gọn: gán h[8] = 1 và giải 8 ẩn
-      // Xây dựng hệ 8x8 từ 8 dòng đầu sau khi trừ h8
       const M = [];
       const b = [];
       for (let i = 0; i < 8; i++) {
-        const row = A[i].slice(0, 8);
-        M.push(row);
-        b.push(-A[i][8]); // vế phải = -a[8]*1
+        M.push(A[i].slice(0, 8));
+        b.push(-A[i][8]);
       }
 
-      // Gaussian elimination với partial pivoting
       for (let col = 0; col < 8; col++) {
-        // Tìm pivot
         let maxRow = col;
         let maxVal = Math.abs(M[col][col]);
         for (let row = col + 1; row < 8; row++) {
@@ -260,8 +63,7 @@ export const getCanvasProcessingScript = (): string => {
         }
       }
 
-      const h = [...b, 1]; // h[0..7] = b, h[8] = 1
-      // Ma trận H 3x3
+      const h = [...b, 1];
       return [
         [h[0], h[1], h[2]],
         [h[3], h[4], h[5]],
@@ -269,14 +71,7 @@ export const getCanvasProcessingScript = (): string => {
       ];
     }
 
-    /**
-     * Áp dụng perspective warp: warp srcCanvas theo 4 góc → canvas kích thước dstW x dstH
-     * Dùng inverse mapping + bilinear interpolation
-     */
     function applyPerspectiveWarp(srcCanvas, corners, dstW, dstH) {
-      // corners: [TL, TR, BL, BR]
-      const [tl, tr, bl, br] = corners;
-
       const dstCanvas = document.createElement('canvas');
       dstCanvas.width = dstW;
       dstCanvas.height = dstH;
@@ -287,26 +82,20 @@ export const getCanvasProcessingScript = (): string => {
       const srcH = srcCanvas.height;
       const srcData = srcCtx.getImageData(0, 0, srcW, srcH).data;
 
-      // dst points: 4 góc của output rectangle
       const dstPts = [
         { x: 0,    y: 0 },
         { x: dstW, y: 0 },
         { x: 0,    y: dstH },
         { x: dstW, y: dstH },
       ];
+      const srcPts = corners;
 
-      // src points: 4 góc tờ giấy trong ảnh gốc
-      const srcPts = [tl, tr, bl, br];
-
-      // Tính inverse homography: dst → src (để inverse mapping)
       const H = computeHomography(dstPts, srcPts);
-
       const dstImgData = dstCtx.createImageData(dstW, dstH);
       const dstData = dstImgData.data;
 
       for (let dy = 0; dy < dstH; dy++) {
         for (let dx = 0; dx < dstW; dx++) {
-          // Áp dụng H để map điểm dst → src
           const wx = H[0][0]*dx + H[0][1]*dy + H[0][2];
           const wy = H[1][0]*dx + H[1][1]*dy + H[1][2];
           const wz = H[2][0]*dx + H[2][1]*dy + H[2][2];
@@ -315,13 +104,11 @@ export const getCanvasProcessingScript = (): string => {
           const sy = wy / wz;
 
           if (sx < 0 || sx >= srcW - 1 || sy < 0 || sy >= srcH - 1) {
-            // Ngoài biên: pixel trắng
             const oi = (dy * dstW + dx) * 4;
             dstData[oi] = 255; dstData[oi+1] = 255; dstData[oi+2] = 255; dstData[oi+3] = 255;
             continue;
           }
 
-          // Bilinear interpolation
           const x0 = Math.floor(sx), y0 = Math.floor(sy);
           const x1 = x0 + 1, y1 = y0 + 1;
           const fx = sx - x0, fy = sy - y0;
@@ -349,17 +136,14 @@ export const getCanvasProcessingScript = (): string => {
     }
 
     /* =====================================================================
-       STEP 4: BOOK SPINE POLYNOMIAL DEWARP
-       Xử lý tờ giấy cong gáy sách bằng polynomial correction
+       2. BOOK SPINE DEWARP (CHỈ KÍCH HOẠT KHI bookMode === true)
        ===================================================================== */
-
     function dewarpBookSpine(srcCanvas) {
       const W = srcCanvas.width;
       const H = srcCanvas.height;
       const srcCtx = srcCanvas.getContext('2d');
       const srcData = srcCtx.getImageData(0, 0, W, H).data;
 
-      // Phát hiện có cong gáy sách không: so sánh luminance 2 nửa trái/phải
       const leftLum = [];
       const rightLum = [];
       const sampleStep = Math.max(1, Math.floor(H / 40));
@@ -380,22 +164,16 @@ export const getCanvasProcessingScript = (): string => {
         rightLum.push(sumR / cnt);
       }
 
-      // Tính gradient luminance theo chiều dọc ở 2 viền để phát hiện cong
       let leftGrad = 0, rightGrad = 0;
       for (let i = 1; i < leftLum.length - 1; i++) {
         leftGrad += Math.abs(leftLum[i] - leftLum[i-1]);
         rightGrad += Math.abs(rightLum[i] - rightLum[i-1]);
       }
 
-      // Nếu không phát hiện cong đáng kể → bỏ qua bước này
       const avgGrad = (leftGrad + rightGrad) / 2;
-      if (avgGrad < 3.5) return srcCanvas;
+      if (avgGrad < 4.0) return srcCanvas; // Không cong đáng kể thì giữ nguyên
 
-      // Áp dụng polynomial horizontal shift correction (barrel distortion style)
-      // Mô hình: tại mỗi hàng y, dịch ngang x theo f(y) = A * (y/H - 0.5)^2
-      // Tham số A được ước lượng từ luminance gradient
       const A = Math.min(0.06, avgGrad / 200) * W;
-
       const dstCanvas = document.createElement('canvas');
       dstCanvas.width = W;
       dstCanvas.height = H;
@@ -404,11 +182,10 @@ export const getCanvasProcessingScript = (): string => {
       const dstPx = dstData.data;
 
       for (let dy = 0; dy < H; dy++) {
-        const t = dy / H - 0.5; // -0.5 đến 0.5
-        const shift = A * t * t; // shift tối đa ở 2 đầu, 0 ở giữa
+        const t = dy / H - 0.5;
+        const shift = A * t * t;
 
         for (let dx = 0; dx < W; dx++) {
-          // Tọa độ nguồn: dịch vào trong (nắn cong → thẳng)
           const sx = dx + shift * (dx < W/2 ? -1 : 1);
           const sy = dy;
 
@@ -436,10 +213,8 @@ export const getCanvasProcessingScript = (): string => {
     }
 
     /* =====================================================================
-       STEP 5: MAGIC PAPER COLOR ENHANCEMENT
-       Làm trắng nền, đậm chữ, giữ màu con dấu/chữ ký
+       3. MAGIC PAPER & ADAPTIVE BINARIZATION ENHANCEMENT
        ===================================================================== */
-
     function applyMagicEnhancement(canvas, filterMode, contrastFactor) {
       const W = canvas.width;
       const H = canvas.height;
@@ -447,114 +222,106 @@ export const getCanvasProcessingScript = (): string => {
       const imgData = ctx.getImageData(0, 0, W, H);
       const data = imgData.data;
 
-      // Bước 1: Tạo background map (shadow/obstacle estimation) bằng cách downsample
-      // Downsample rất nhỏ (ví dụ 64x64) để tính toán nhanh, bỏ qua nhiễu chữ
-      const bgW = 64, bgH = Math.max(1, Math.floor(64 * (H / W)));
-      const bgCanvas = document.createElement('canvas');
-      bgCanvas.width = bgW; bgCanvas.height = bgH;
-      const bgCtx = bgCanvas.getContext('2d');
-      bgCtx.drawImage(canvas, 0, 0, bgW, bgH);
-      const bgImgData = bgCtx.getImageData(0, 0, bgW, bgH);
-      const bgData = bgImgData.data;
+      // Ước lượng nền chiếu sáng (Illumination background estimation)
+      const bgW = Math.max(16, Math.floor(W / 32));
+      const bgH = Math.max(16, Math.floor(H / 32));
+      const bgMap = new Float32Array(bgW * bgH);
+      const bgCount = new Uint16Array(bgW * bgH);
 
-      // Dilation (Max filter) trên bg map để xóa sạch chữ, giữ lại màu nền & bóng (shadows)
-      const dilated = new Uint8Array(bgW * bgH);
-      for(let y = 0; y < bgH; y++) {
-        for(let x = 0; x < bgW; x++) {
-           let maxLum = 0;
-           // Quét vùng 5x5 quanh pixel để bung rộng vùng trắng, lấp chữ đen
-           for(let dy = -2; dy <= 2; dy++) {
-             for(let dx = -2; dx <= 2; dx++) {
-                const nx = Math.max(0, Math.min(bgW - 1, x + dx));
-                const ny = Math.max(0, Math.min(bgH - 1, y + dy));
-                const idx = (ny * bgW + nx) * 4;
-                const lum = 0.299 * bgData[idx] + 0.587 * bgData[idx+1] + 0.114 * bgData[idx+2];
-                if(lum > maxLum) maxLum = lum;
-             }
-           }
-           dilated[y * bgW + x] = maxLum;
+      const cellW = W / bgW;
+      const cellH = H / bgH;
+
+      for (let y = 0; y < H; y += 4) {
+        const by = Math.min(bgH - 1, Math.floor(y / cellH));
+        for (let x = 0; x < W; x += 4) {
+          const bx = Math.min(bgW - 1, Math.floor(x / cellW));
+          const idx = (y * W + x) * 4;
+          const lum = 0.299 * data[idx] + 0.587 * data[idx+1] + 0.114 * data[idx+2];
+          const bIdx = by * bgW + bx;
+          bgMap[bIdx] += lum;
+          bgCount[bIdx]++;
         }
       }
 
-      // Blur nhẹ map đã dilated để background estimate mượt mà
-      const smoothedBg = new Uint8Array(bgW * bgH);
-      for(let y = 0; y < bgH; y++) {
-        for(let x = 0; x < bgW; x++) {
-           let sumLum = 0, count = 0;
-           for(let dy = -1; dy <= 1; dy++) {
-             for(let dx = -1; dx <= 1; dx++) {
-                const nx = Math.max(0, Math.min(bgW - 1, x + dx));
-                const ny = Math.max(0, Math.min(bgH - 1, y + dy));
-                sumLum += dilated[ny * bgW + nx];
-                count++;
-             }
-           }
-           smoothedBg[y * bgW + x] = sumLum / count;
+      const smoothedBg = new Float32Array(bgW * bgH);
+      for (let by = 0; by < bgH; by++) {
+        for (let bx = 0; bx < bgW; bx++) {
+          let sum = 0, count = 0;
+          for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
+              const ny = by + dy, nx = bx + dx;
+              if (ny >= 0 && ny < bgH && nx >= 0 && nx < bgW) {
+                const bIdx = ny * bgW + nx;
+                if (bgCount[bIdx] > 0) {
+                  sum += bgMap[bIdx] / bgCount[bIdx];
+                  count++;
+                }
+              }
+            }
+          }
+          smoothedBg[by * bgW + bx] = count > 0 ? (sum / count) : 200;
         }
       }
 
-      // Bước 2: Duyệt từng pixel ảnh gốc, chuẩn hóa (trừ bóng) và làm nét chữ
-      // Cắt rìa 3% xung quanh để loại bỏ chướng ngại vật ngoài mép giấy
-      const bufX = Math.round(W * 0.03);
-      const bufY = Math.round(H * 0.03);
+      const bufX = Math.floor(W * 0.015);
+      const bufY = Math.floor(H * 0.015);
 
       for (let y = 0; y < H; y++) {
-        const bgY = Math.floor((y / H) * bgH);
+        const bgY = Math.min(bgH - 1, Math.floor((y / H) * bgH));
         const isYEdge = y < bufY || y > H - bufY;
-        
+
         for (let x = 0; x < W; x++) {
-          const bgX = Math.floor((x / W) * bgW);
-          const bgLum = Math.max(10, smoothedBg[bgY * bgW + bgX]); // Tránh chia 0
-          
+          const bgX = Math.min(bgW - 1, Math.floor((x / W) * bgW));
+          const bgLum = Math.max(15, smoothedBg[bgY * bgW + bgX]);
+
           const idx = (y * W + x) * 4;
           let r = data[idx], g = data[idx+1], b = data[idx+2];
           const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-          
-          // Phát hiện mực màu (con dấu đỏ, mực xanh dương, chữ ký)
+
+          // Bảo vệ màu con dấu đỏ và mực xanh dương
           const isRedStamp = r > 90 && r > g + 35 && r > b + 35;
           const isBlueInk  = b > 80 && b > r + 25 && b > g + 25;
-          
-          // Chuẩn hóa loại bỏ shadow (Adaptive Background Normalization)
-          // Ảnh / Background * 255. Bất chấp bóng ngón tay hay đèn, giấy sẽ luôn là ~255.
+
+          // Chuẩn hóa tương đối theo nền cục bộ
           let normLum = (lum / bgLum) * 255;
-          
           const isEdge = isYEdge || x < bufX || x > W - bufX;
 
-          // Xóa chướng ngại vật ở rìa (ngón tay, cạnh viền thừa) nếu nó không phải chữ ký
+          // Dọn viền ngoài nếu là shadow đen thừa
           if (isEdge && !isRedStamp && !isBlueInk && normLum < 190) {
-             data[idx] = 255; data[idx+1] = 255; data[idx+2] = 255;
-             continue;
+            data[idx] = 255; data[idx+1] = 255; data[idx+2] = 255;
+            continue;
           }
 
           if (filterMode === 'magic') {
             if (isRedStamp) {
-              r = Math.min(255, Math.round(r * 1.5));
-              g = Math.max(0, Math.round(g * 0.3));
-              b = Math.max(0, Math.round(b * 0.3));
+              r = Math.min(255, Math.round(r * 1.4));
+              g = Math.max(0, Math.round(g * 0.4));
+              b = Math.max(0, Math.round(b * 0.4));
             } else if (isBlueInk) {
-              b = Math.min(255, Math.round(b * 1.5));
-              r = Math.max(0, Math.round(r * 0.3));
+              b = Math.min(255, Math.round(b * 1.4));
+              r = Math.max(0, Math.round(r * 0.4));
               g = Math.max(0, Math.round(g * 0.5));
             } else {
-              // Thuật toán Soft Binarization / Sigmoid contrast mạnh
-              // Giúp giấy trắng bóc và chữ siêu đen, cực kỳ sắc nét
-              if (normLum > 195) { 
-                 r = 255; g = 255; b = 255; // White paper
+              // Nâng cấp: Soft Gamma binarization chống mất nét chữ chì
+              if (normLum > 195) {
+                r = g = b = 255;
               } else {
-                 let blackFactor = normLum / 195; // Tỉ lệ 0..1
-                 blackFactor = Math.pow(blackFactor, 3.5); // Ép đường cong gamma dốc mạnh xuống
-                 let finalVal = Math.round(blackFactor * 210); 
-                 r = finalVal; g = finalVal; b = finalVal;
+                let factor = Math.max(0, normLum / 195);
+                factor = Math.pow(factor, 2.6); // Mềm hơn 3.5 để bảo vệ nét mảnh
+                const finalVal = Math.round(factor * 215);
+                r = g = b = finalVal;
               }
             }
           } else if (filterMode === 'bw') {
-            r = g = b = (normLum > 185 && !isRedStamp && !isBlueInk) ? 255 : 0;
+            // Adaptive local threshold thay vì so sánh tuyệt đối với 185
+            const localThreshold = bgLum * 0.76;
+            r = g = b = (lum > localThreshold && !isRedStamp && !isBlueInk) ? 255 : 0;
           } else if (filterMode === 'grayscale') {
             let gray = normLum;
-            if (gray > 220) gray = 255; // Trắng hóa nền nhẹ
-            r = g = b = Math.min(255, gray);
+            if (gray > 220) gray = 255;
+            r = g = b = Math.min(255, Math.round(gray));
           }
-          
+
           data[idx] = r; data[idx+1] = g; data[idx+2] = b;
         }
       }
@@ -564,9 +331,8 @@ export const getCanvasProcessingScript = (): string => {
     }
 
     /* =====================================================================
-       MAIN: processImageCanvas — Tích hợp toàn bộ pipeline
+       4. MAIN: processImageCanvas
        ===================================================================== */
-
     function processImageCanvas(imgElement, filterMode, options) {
       options = options || {};
       const trimPercent = options.trimMarginPercent || 0;
@@ -576,7 +342,6 @@ export const getCanvasProcessingScript = (): string => {
       const origHeight = imgElement.naturalHeight || imgElement.height;
       if (!origWidth || !origHeight) return imgElement.src;
 
-      // --- 1. Load ảnh vào canvas gốc ---
       const srcCanvas = document.createElement('canvas');
       srcCanvas.width  = origWidth;
       srcCanvas.height = origHeight;
@@ -587,80 +352,19 @@ export const getCanvasProcessingScript = (): string => {
         return srcCanvas.toDataURL('image/jpeg', 0.95);
       }
 
-      // --- 2. Crop tỉa lề ban đầu ---
       let workCanvas = srcCanvas;
       if (trimPercent > 0 && !options.customCornersRatio) {
         const cropX = Math.round(origWidth  * (trimPercent / 100));
         const cropY = Math.round(origHeight * (trimPercent / 100));
         const cropW = origWidth  - cropX * 2;
         const cropH = origHeight - cropY * 2;
-        const trimCanvas = document.createElement('canvas');
-        trimCanvas.width = cropW;
-        trimCanvas.height = cropH;
-        trimCanvas.getContext('2d').drawImage(srcCanvas, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
-        workCanvas = trimCanvas;
-      }
-
-      // --- 3. Bỏ qua Tự động tìm góc (Native Scanner đã xử lý), nhưng GỌT VIỀN ĐEN thừa ---
-      if (!options.customCornersRatio) {
-        try {
-          const wW = workCanvas.width, wH = workCanvas.height;
-          const wCtx = workCanvas.getContext('2d');
-          const wData = wCtx.getImageData(0, 0, wW, wH).data;
-          
-          let minX = 0, maxX = wW - 1, minY = 0, maxY = wH - 1;
-
-          for (let y = 0; y < Math.floor(wH * 0.25); y++) {
-            let light = 0;
-            for (let x = 0; x < wW; x += 4) {
-              const idx = (y * wW + x) * 4;
-              if (0.299*wData[idx] + 0.587*wData[idx+1] + 0.114*wData[idx+2] > 110) light++;
-            }
-            if (light / (wW / 4) > 0.3) { minY = y; break; }
-          }
-          for (let y = wH - 1; y > Math.floor(wH * 0.75); y--) {
-            let light = 0;
-            for (let x = 0; x < wW; x += 4) {
-              const idx = (y * wW + x) * 4;
-              if (0.299*wData[idx] + 0.587*wData[idx+1] + 0.114*wData[idx+2] > 110) light++;
-            }
-            if (light / (wW / 4) > 0.3) { maxY = y; break; }
-          }
-          for (let x = 0; x < Math.floor(wW * 0.25); x++) {
-            let light = 0;
-            for (let y = minY; y <= maxY; y += 4) {
-              const idx = (y * wW + x) * 4;
-              if (0.299*wData[idx] + 0.587*wData[idx+1] + 0.114*wData[idx+2] > 110) light++;
-            }
-            if (light / ((maxY - minY) / 4) > 0.3) { minX = x; break; }
-          }
-          for (let x = wW - 1; x > Math.floor(wW * 0.75); x--) {
-            let light = 0;
-            for (let y = minY; y <= maxY; y += 4) {
-              const idx = (y * wW + x) * 4;
-              if (0.299*wData[idx] + 0.587*wData[idx+1] + 0.114*wData[idx+2] > 110) light++;
-            }
-            if (light / ((maxY - minY) / 4) > 0.3) { maxX = x; break; }
-          }
-
-          // Cắt lẹm thêm 1.5% để xóa triệt để viền bóng mờ
-          const trimX = Math.floor(wW * 0.015);
-          const trimY = Math.floor(wH * 0.015);
-          minX = Math.min(wW/2, minX + trimX);
-          maxX = Math.max(wW/2, maxX - trimX);
-          minY = Math.min(wH/2, minY + trimY);
-          maxY = Math.max(wH/2, maxY - trimY);
-
-          const cropW = maxX - minX;
-          const cropH = maxY - minY;
-          if (cropW > wW * 0.4 && cropH > wH * 0.4) {
-            const trimCanvas2 = document.createElement('canvas');
-            trimCanvas2.width = cropW;
-            trimCanvas2.height = cropH;
-            trimCanvas2.getContext('2d').drawImage(workCanvas, minX, minY, cropW, cropH, 0, 0, cropW, cropH);
-            workCanvas = trimCanvas2;
-          }
-        } catch(e) {}
+        if (cropW > 50 && cropH > 50) {
+          const trimCanvas = document.createElement('canvas');
+          trimCanvas.width = cropW;
+          trimCanvas.height = cropH;
+          trimCanvas.getContext('2d').drawImage(srcCanvas, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+          workCanvas = trimCanvas;
+        }
       }
 
       const W = workCanvas.width, H = workCanvas.height;
@@ -669,10 +373,9 @@ export const getCanvasProcessingScript = (): string => {
         corners = options.customCornersRatio.map(r => ({ x: r.x * W, y: r.y * H }));
       }
 
-      // --- 4. Perspective Warp (Chỉ thực hiện nếu user có sửa góc) ---
+      // Perspective Warp
       let warpedCanvas = workCanvas;
-      
-      if (corners) {
+      if (corners && corners.length === 4) {
         const widthTop  = Math.hypot(corners[1].x - corners[0].x, corners[1].y - corners[0].y);
         const widthBot  = Math.hypot(corners[3].x - corners[2].x, corners[3].y - corners[2].y);
         const heightLeft  = Math.hypot(corners[2].x - corners[0].x, corners[2].y - corners[0].y);
@@ -685,24 +388,24 @@ export const getCanvasProcessingScript = (): string => {
 
         try {
           warpedCanvas = applyPerspectiveWarp(workCanvas, corners, finalW, finalH);
+        } catch(e) {}
+      }
+
+      // Book Spine Dewarp — TUYỆT ĐỐI CHỈ CHẠY KHI options.bookMode === true
+      let dewarpedCanvas = warpedCanvas;
+      if (options.bookMode === true) {
+        try {
+          dewarpedCanvas = dewarpBookSpine(warpedCanvas);
         } catch(e) {
-          // Bỏ qua nếu lỗi warp
+          dewarpedCanvas = warpedCanvas;
         }
       }
 
-      // --- 7. Book Spine Dewarp ---
-      let dewarpedCanvas;
-      try {
-        dewarpedCanvas = dewarpBookSpine(warpedCanvas);
-      } catch(e) {
-        dewarpedCanvas = warpedCanvas;
-      }
-
-      // --- 8. Magic Enhancement (color processing) ---
+      // Magic / Color Enhancement
       if (filterMode !== 'original') {
         try {
           applyMagicEnhancement(dewarpedCanvas, filterMode, contrastFactor);
-        } catch(e) { /* giữ nguyên nếu lỗi */ }
+        } catch(e) {}
       }
 
       return dewarpedCanvas.toDataURL('image/jpeg', 0.95);

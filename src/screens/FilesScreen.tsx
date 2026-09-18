@@ -7,7 +7,7 @@ import { Ionicons } from '@expo/vector-icons';
 import * as FileSystem from 'expo-file-system/legacy';
 import {
   getDocumentDirectory, copyFileToDocuments, listDocumentItems,
-  DocumentItem
+  DocumentItem, sanitizeFileName
 } from '../utils/fileHelper';
 import * as Sharing from 'expo-sharing';
 import * as ImagePicker from 'expo-image-picker';
@@ -24,6 +24,12 @@ export default function FilesScreen() {
   const [folderDialogVisible, setFolderDialogVisible] = useState(false);
   const [folderName, setFolderName] = useState('');
 
+  // File action modal & rename
+  const [selectedItem, setSelectedItem] = useState<DocumentItem | null>(null);
+  const [actionModalVisible, setActionModalVisible] = useState(false);
+  const [renameDialogVisible, setRenameDialogVisible] = useState(false);
+  const [renameValue, setRenameValue] = useState('');
+
   const loadFiles = async () => {
     try {
       const docs = await listDocumentItems(currentFolder, ['.pdf', '.docx', '.xlsx']);
@@ -37,10 +43,29 @@ export default function FilesScreen() {
     loadFiles();
   }, [currentFolder]));
 
+  const handleOpenFile = async (item: DocumentItem) => {
+    try {
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(item.uri, {
+          dialogTitle: `Mở tài liệu: ${item.name}`,
+          mimeType: item.name.endsWith('.pdf')
+            ? 'application/pdf'
+            : item.name.endsWith('.docx')
+            ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            : item.name.endsWith('.xlsx')
+            ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            : undefined,
+        });
+      }
+    } catch {
+      Alert.alert('Lỗi', 'Không thể mở tài liệu.');
+    }
+  };
+
   const handleShareFile = async (item: DocumentItem) => {
     try {
       if (await Sharing.isAvailableAsync()) {
-        await Sharing.shareAsync(item.uri);
+        await Sharing.shareAsync(item.uri, { dialogTitle: `Chia sẻ: ${item.name}` });
       }
     } catch {
       Alert.alert('Lỗi', 'Không thể chia sẻ file.');
@@ -57,6 +82,8 @@ export default function FilesScreen() {
         onPress: async () => {
           try {
             await FileSystem.deleteAsync(item.uri, { idempotent: true });
+            setActionModalVisible(false);
+            setSelectedItem(null);
             loadFiles();
           } catch {
             Alert.alert('Lỗi', `Không thể xóa ${isFolder ? 'thư mục' : 'tập tin'}.`);
@@ -64,6 +91,38 @@ export default function FilesScreen() {
         }
       }
     ]);
+  };
+
+  const handleStartRename = (item: DocumentItem) => {
+    setSelectedItem(item);
+    setActionModalVisible(false);
+    const lastDot = item.name.lastIndexOf('.');
+    setRenameValue(lastDot !== -1 ? item.name.substring(0, lastDot) : item.name);
+    setRenameDialogVisible(true);
+  };
+
+  const handleConfirmRename = async () => {
+    if (!selectedItem || !renameValue.trim()) {
+      Alert.alert('Lỗi', 'Vui lòng nhập tên tài liệu hợp lệ.');
+      return;
+    }
+    try {
+      const lastDot = selectedItem.name.lastIndexOf('.');
+      const ext = lastDot !== -1 ? selectedItem.name.substring(lastDot) : '';
+      const cleanName = renameValue.trim().replace(/[^a-zA-Z0-9_\-\sÀ-ÿ]/g, '_');
+      const newFileName = cleanName + ext;
+      const root = getDocumentDirectory();
+      const targetDir = currentFolder ? `${root}${currentFolder}/` : root;
+      const newUri = targetDir + newFileName;
+
+      await FileSystem.moveAsync({ from: selectedItem.uri, to: newUri });
+      setRenameDialogVisible(false);
+      setSelectedItem(null);
+      loadFiles();
+      Alert.alert('✅ Thành công', `Đã đổi tên thành "${newFileName}"`);
+    } catch {
+      Alert.alert('Lỗi', 'Không thể đổi tên file.');
+    }
   };
 
   const handleImportImage = async () => {
@@ -82,7 +141,7 @@ export default function FilesScreen() {
       let result = await DocumentPicker.getDocumentAsync({ type: 'application/pdf' });
       if (!result.canceled && result.assets?.length > 0) {
         const { uri: sourceUri, name: originalName } = result.assets[0];
-        const safeName = (originalName || 'PDF_' + Date.now()).replace(/[^a-zA-Z0-9_\-\sÀ-ÿ]/g, '_').replace(/\.pdf$/i, '');
+        const safeName = sanitizeFileName((originalName || 'PDF_' + Date.now()).replace(/\.pdf$/i, ''), 'PDF');
         await copyFileToDocuments(sourceUri, safeName + '.pdf', currentFolder);
         Alert.alert('✅ Thành công', `Đã nhập tài liệu: ${safeName}.pdf`);
         loadFiles();
@@ -93,7 +152,7 @@ export default function FilesScreen() {
   };
 
   const doCreateFolder = async () => {
-    const trimmed = folderName.trim().replace(/[^a-zA-Z0-9_\-À-ÿ\s]/g, '_');
+    const trimmed = sanitizeFileName(folderName.trim(), '');
     if (!trimmed) {
       Alert.alert('Lỗi', 'Vui lòng nhập tên thư mục hợp lệ.');
       return;
@@ -139,8 +198,9 @@ export default function FilesScreen() {
       const nextPath = currentFolder ? `${currentFolder}/${item.name}` : item.name;
       setCurrentFolder(nextPath);
     } else {
-      // Chia sẻ hoặc xem
-      handleShareFile(item);
+      // Mở menu thao tác tài liệu
+      setSelectedItem(item);
+      setActionModalVisible(true);
     }
   };
 
@@ -278,11 +338,133 @@ export default function FilesScreen() {
           </View>
         </View>
       </Modal>
+
+      {/* File Action Modal */}
+      <Modal visible={actionModalVisible} animationType="slide" transparent>
+        <TouchableOpacity
+          style={s.modalBg}
+          activeOpacity={1}
+          onPress={() => setActionModalVisible(false)}
+        >
+          <View style={[s.actionSheet, { backgroundColor: theme.card, borderColor: theme.border }]}>
+            {selectedItem && (
+              <>
+                <View style={s.actionHeader}>
+                  <View style={[s.fileIconBg, { backgroundColor: getItemVisual(selectedItem).bg, marginRight: 12 }]}>
+                    <Ionicons name={getItemVisual(selectedItem).icon as any} size={24} color={getItemVisual(selectedItem).color} />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={[s.actionFileName, { color: theme.text }]} numberOfLines={1}>
+                      {selectedItem.name}
+                    </Text>
+                    <Text style={{ fontSize: 12, color: theme.textSub, marginTop: 2 }}>
+                      {getItemVisual(selectedItem).label} • {formatFileSize(selectedItem.size)}
+                    </Text>
+                  </View>
+                  <TouchableOpacity onPress={() => setActionModalVisible(false)}>
+                    <Ionicons name="close" size={24} color={theme.textSub} />
+                  </TouchableOpacity>
+                </View>
+
+                <View style={[s.actionDivider, { backgroundColor: theme.border }]} />
+
+                <TouchableOpacity
+                  style={s.actionRow}
+                  onPress={() => {
+                    setActionModalVisible(false);
+                    handleOpenFile(selectedItem);
+                  }}
+                >
+                  <View style={[s.actionRowIcon, { backgroundColor: theme.accent + '20' }]}>
+                    <Ionicons name="eye-outline" size={20} color={theme.accent} />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={[s.actionRowText, { color: theme.text }]}>Mở / Xem tài liệu</Text>
+                    <Text style={{ fontSize: 12, color: theme.textSub }}>Xem nội dung hoặc mở bằng ứng dụng mặc định</Text>
+                  </View>
+                  <Ionicons name="chevron-forward" size={18} color={theme.textMuted} />
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={s.actionRow}
+                  onPress={() => {
+                    setActionModalVisible(false);
+                    handleShareFile(selectedItem);
+                  }}
+                >
+                  <View style={[s.actionRowIcon, { backgroundColor: theme.blue + '20' }]}>
+                    <Ionicons name="share-social-outline" size={20} color={theme.blue} />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={[s.actionRowText, { color: theme.text }]}>Chia sẻ tập tin</Text>
+                    <Text style={{ fontSize: 12, color: theme.textSub }}>Gửi qua Zalo, Drive, Gmail, Bluetooth...</Text>
+                  </View>
+                  <Ionicons name="chevron-forward" size={18} color={theme.textMuted} />
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={s.actionRow}
+                  onPress={() => handleStartRename(selectedItem)}
+                >
+                  <View style={[s.actionRowIcon, { backgroundColor: '#ff980020' }]}>
+                    <Ionicons name="create-outline" size={20} color="#ff9800" />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={[s.actionRowText, { color: theme.text }]}>Đổi tên tài liệu</Text>
+                    <Text style={{ fontSize: 12, color: theme.textSub }}>Thay đổi tên hiển thị của tập tin</Text>
+                  </View>
+                  <Ionicons name="chevron-forward" size={18} color={theme.textMuted} />
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={s.actionRow}
+                  onPress={() => handleDeleteItem(selectedItem)}
+                >
+                  <View style={[s.actionRowIcon, { backgroundColor: theme.danger + '20' }]}>
+                    <Ionicons name="trash-outline" size={20} color={theme.danger} />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={[s.actionRowText, { color: theme.danger }]}>Xóa tài liệu</Text>
+                    <Text style={{ fontSize: 12, color: theme.textSub }}>Xóa vĩnh viễn khỏi bộ nhớ máy</Text>
+                  </View>
+                  <Ionicons name="chevron-forward" size={18} color={theme.textMuted} />
+                </TouchableOpacity>
+              </>
+            )}
+          </View>
+        </TouchableOpacity>
+      </Modal>
+
+      {/* Rename Modal */}
+      <Modal visible={renameDialogVisible} animationType="fade" transparent>
+        <View style={s.modalBg}>
+          <View style={[s.dialog, { backgroundColor: theme.card, borderColor: theme.border }]}>
+            <Text style={[s.dialogTitle, { color: theme.text }]}>Đổi tên tài liệu</Text>
+            <TextInput
+              style={[s.dialogInput, { backgroundColor: theme.surface, borderColor: theme.border, color: theme.text }]}
+              value={renameValue}
+              onChangeText={setRenameValue}
+              placeholder="Nhập tên mới"
+              placeholderTextColor={theme.textMuted}
+              autoFocus
+              selectTextOnFocus
+            />
+            <View style={s.dialogActions}>
+              <TouchableOpacity style={[s.dialogBtn, { backgroundColor: theme.surface }]} onPress={() => setRenameDialogVisible(false)}>
+                <Text style={{ color: theme.textSub, fontWeight: '600' }}>Hủy</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[s.dialogBtn, { backgroundColor: theme.accent }]} onPress={handleConfirmRename}>
+                <Text style={{ color: '#fff', fontWeight: 'bold' }}>Lưu</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
 
-const s = StyleSheet.create({
+const s: any = StyleSheet.create({
   container: { flex: 1 },
   header: {
     paddingHorizontal: 20,
@@ -401,5 +583,42 @@ const s = StyleSheet.create({
     paddingVertical: 10,
     paddingHorizontal: 18,
     borderRadius: 8,
+  },
+  actionSheet: {
+    width: '100%',
+    borderRadius: 20,
+    padding: 20,
+    borderWidth: 1,
+    elevation: 8,
+  },
+  actionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  actionFileName: {
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  actionDivider: {
+    height: 1,
+    marginVertical: 8,
+  },
+  actionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 12,
+    gap: 12,
+  },
+  actionRowIcon: {
+    width: 38,
+    height: 38,
+    borderRadius: 10,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  actionRowText: {
+    fontSize: 15,
+    fontWeight: '600',
   },
 });

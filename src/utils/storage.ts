@@ -1,14 +1,25 @@
 /**
- * storage.ts — Key-Value storage dùng expo-file-system
- * Thay thế @react-native-async-storage/async-storage
- * Không phụ thuộc native module, tương thích RN 0.86 + New Arch
- * Bổ sung: Atomic Write, Write Queue chống Race Condition, Backup Recovery
+ * storage.ts — Key-Value storage an toàn với Schema Versioning & Atomic Write
+ * - Phục vụ thay thế @react-native-async-storage/async-storage
+ * - Schema Versioning & Tự động Migration từ định dạng cũ
+ * - FIFO Mutex Write Queue chống race condition
+ * - Atomic write (.tmp -> .json) kèm bản lưu dự phòng (.bak)
+ * - Ném StorageError rõ ràng khi ghi hỏng, không nuốt lỗi
  */
 import * as FileSystem from 'expo-file-system/legacy';
+import { StorageSchema } from '../types/domain';
+
+export class StorageError extends Error {
+  constructor(message: string, public readonly cause?: unknown) {
+    super(`[StorageError] ${message}`);
+    this.name = 'StorageError';
+  }
+}
+
+const CURRENT_SCHEMA_VERSION = 1;
 
 function getStorePaths(): { storeFile: string; tmpFile: string; bakFile: string } {
-  const fs = FileSystem as any;
-  const dir = fs.documentDirectory ?? fs.cacheDirectory ?? '';
+  const dir = FileSystem.documentDirectory ?? FileSystem.cacheDirectory ?? '';
   return {
     storeFile: dir + '_app_storage.json',
     tmpFile: dir + '_app_storage.json.tmp',
@@ -16,18 +27,44 @@ function getStorePaths(): { storeFile: string; tmpFile: string; bakFile: string 
   };
 }
 
-let cache: Record<string, string> | null = null;
+let cache: StorageSchema | null = null;
 let writeQueue: Promise<void> = Promise.resolve();
 
-async function readJsonFile(path: string): Promise<Record<string, string> | null> {
-  try {
-    const info = await (FileSystem as any).getInfoAsync(path);
-    if (info.exists && info.size && info.size > 0) {
-      const raw = await (FileSystem as any).readAsStringAsync(path);
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        return parsed as Record<string, string>;
+/**
+ * Migration helper: Chuyển đổi dữ liệu cũ (flat key-value) sang StorageSchema versioned
+ */
+function migrateData(rawObj: any): StorageSchema {
+  if (rawObj && typeof rawObj === 'object') {
+    if (typeof rawObj.version === 'number' && rawObj.data && typeof rawObj.data === 'object') {
+      return rawObj as StorageSchema;
+    }
+    // Dữ liệu cũ dạng phẳng { key: value }
+    const cleanData: Record<string, string> = {};
+    for (const [k, v] of Object.entries(rawObj)) {
+      if (typeof v === 'string') {
+        cleanData[k] = v;
       }
+    }
+    return {
+      version: CURRENT_SCHEMA_VERSION,
+      lastUpdated: Date.now(),
+      data: cleanData,
+    };
+  }
+  return {
+    version: CURRENT_SCHEMA_VERSION,
+    lastUpdated: Date.now(),
+    data: {},
+  };
+}
+
+async function readJsonFile(path: string): Promise<StorageSchema | null> {
+  try {
+    const info = await FileSystem.getInfoAsync(path);
+    if (info.exists && info.size && info.size > 0) {
+      const raw = await FileSystem.readAsStringAsync(path);
+      const parsed = JSON.parse(raw);
+      return migrateData(parsed);
     }
   } catch (e) {
     console.warn(`[Storage] Failed to read ${path}:`, e);
@@ -35,7 +72,7 @@ async function readJsonFile(path: string): Promise<Record<string, string> | null
   return null;
 }
 
-async function loadCache(): Promise<Record<string, string>> {
+async function loadCache(): Promise<StorageSchema> {
   if (cache !== null) return cache;
   const { storeFile, bakFile, tmpFile } = getStorePaths();
 
@@ -44,7 +81,7 @@ async function loadCache(): Promise<Record<string, string>> {
 
   // 2. Nếu file chính hỏng/rỗng, thử khôi phục từ file backup
   if (loaded === null) {
-    console.warn('[Storage] Main file corrupted or missing, attempting backup restore...');
+    console.warn('[Storage] Main store corrupted or missing, attempting backup restore...');
     loaded = await readJsonFile(bakFile);
   }
 
@@ -53,45 +90,60 @@ async function loadCache(): Promise<Record<string, string>> {
     loaded = await readJsonFile(tmpFile);
   }
 
-  cache = loaded ?? {};
+  cache = loaded ?? {
+    version: CURRENT_SCHEMA_VERSION,
+    lastUpdated: Date.now(),
+    data: {},
+  };
   return cache;
 }
 
-async function executeAtomicSave(data: Record<string, string>): Promise<void> {
+async function executeAtomicSave(snapshot: StorageSchema): Promise<void> {
   const { storeFile, tmpFile, bakFile } = getStorePaths();
-  const fs = FileSystem as any;
-  const jsonContent = JSON.stringify(data);
+  snapshot.lastUpdated = Date.now();
+  const jsonContent = JSON.stringify(snapshot);
 
   try {
     // Bước 1: Ghi dữ liệu vào file tạm .tmp
-    await fs.writeAsStringAsync(tmpFile, jsonContent);
+    await FileSystem.writeAsStringAsync(tmpFile, jsonContent);
 
     // Bước 2: Tạo bản backup từ file hiện tại (nếu tồn tại)
-    const storeInfo = await fs.getInfoAsync(storeFile);
+    const storeInfo = await FileSystem.getInfoAsync(storeFile);
     if (storeInfo.exists && storeInfo.size && storeInfo.size > 0) {
       try {
-        await fs.copyAsync({ from: storeFile, to: bakFile });
+        await FileSystem.copyAsync({ from: storeFile, to: bakFile });
       } catch {
-        // bỏ qua nếu copy backup thất bại
+        // Bỏ qua lỗi copy backup nếu hệ thống bận
       }
     }
 
     // Bước 3: Đổi tên file tạm .tmp thành file chính .json (Atomic move)
-    await fs.moveAsync({ from: tmpFile, to: storeFile });
-  } catch (err) {
-    console.error('[Storage] Atomic write failed:', err);
-    // Cố gắng dọn file tmp nếu lỗi
+    await FileSystem.moveAsync({ from: tmpFile, to: storeFile });
+
+    // Bước 4: Dọn dẹp file backup tạm sau khi ghi đè thành công
     try {
-      await fs.deleteAsync(tmpFile, { idempotent: true });
+      await FileSystem.deleteAsync(bakFile, { idempotent: true });
     } catch {}
+  } catch (err) {
+    // Dọn dẹp file tạm nếu xảy ra lỗi
+    try {
+      await FileSystem.deleteAsync(tmpFile, { idempotent: true });
+    } catch {}
+    throw new StorageError('Atomic write failed to save app storage', err);
   }
 }
 
 function queueSave(): Promise<void> {
-  // Xếp hàng ghi tuần tự qua Promise chain (Mutex) để chống race condition
-  const snapshot = cache ? { ...cache } : {};
+  if (!cache) return Promise.resolve();
+  const snapshot: StorageSchema = {
+    version: cache.version,
+    lastUpdated: Date.now(),
+    data: { ...cache.data },
+  };
+
   writeQueue = writeQueue.then(() => executeAtomicSave(snapshot)).catch(e => {
     console.error('[Storage] Queue save error:', e);
+    throw e;
   });
   return writeQueue;
 }
@@ -99,27 +151,32 @@ function queueSave(): Promise<void> {
 export const Storage = {
   async getItem(key: string): Promise<string | null> {
     const store = await loadCache();
-    return store[key] ?? null;
+    return store.data[key] ?? null;
   },
 
   async setItem(key: string, value: string): Promise<void> {
     const store = await loadCache();
-    store[key] = value;
+    store.data[key] = value;
     await queueSave();
   },
 
   async removeItem(key: string): Promise<void> {
     const store = await loadCache();
-    delete store[key];
+    delete store.data[key];
     await queueSave();
   },
 
   async clear(): Promise<void> {
-    cache = {};
+    const store = await loadCache();
+    store.data = {};
     await queueSave();
   },
 
-  // Phương thức hỗ trợ flush toàn bộ hàng đợi ghi trước khi thoát/kill
+  async getAllKeys(): Promise<string[]> {
+    const store = await loadCache();
+    return Object.keys(store.data);
+  },
+
   async flush(): Promise<void> {
     await writeQueue;
   },

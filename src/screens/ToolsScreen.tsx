@@ -1,28 +1,41 @@
-import React, { useState, useEffect } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, ScrollView, Alert, Modal, TextInput, ActivityIndicator, Dimensions, Image, Platform } from 'react-native';
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  View, Text, StyleSheet, TouchableOpacity, ScrollView, Alert,
+  Modal, TextInput, ActivityIndicator, Dimensions
+} from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
 import * as Clipboard from 'expo-clipboard';
-import * as FileSystem from 'expo-file-system/legacy';
-import { savePdfToDocuments, saveBase64ToDocuments, copyFileToDocuments, getDocumentDirectory, listDocumentFiles } from '../utils/fileHelper';
-import * as Print from 'expo-print';
 import * as Sharing from 'expo-sharing';
 import { useNavigation } from '@react-navigation/native';
 import { useTheme } from '../theme';
-// Heavy libs — lazy-loaded khi dùng để tránh crash khởi động
-// pdf-lib, docx, xlsx, nerdamer được require() trong từng hàm
+
 import Storage from '../utils/storage';
+import { STORAGE_KEYS } from '../constants/config';
+import { listDocumentFiles, sanitizeFileName } from '../utils/fileHelper';
+
 import GeminiService from '../services/ai/gemini.service';
 import MathSolverService from '../services/ai/math.solver';
 import TranslationService from '../services/translation/translation.service';
+import OfficeExportService from '../services/office/officeExport.service';
+import PdfToolsService from '../services/pdf/pdfTools.service';
+
 const { width } = Dimensions.get('window');
 
 export default function ToolsScreen({ route }: any) {
   const navigation = useNavigation<any>();
   const { theme } = useTheme();
+  const isMounted = useRef(true);
 
-  // Modals
+  useEffect(() => {
+    isMounted.current = true;
+    return () => {
+      isMounted.current = false;
+    };
+  }, []);
+
+  // Modals state
   const [loading, setLoading] = useState<boolean>(false);
   const [loadingText, setLoadingText] = useState<string>('Đang xử lý...');
   const [ocrModalVisible, setOcrModalVisible] = useState<boolean>(false);
@@ -33,38 +46,38 @@ export default function ToolsScreen({ route }: any) {
   const [translateOriginal, setTranslateOriginal] = useState<string>('');
   const [translateResult, setTranslateResult] = useState<string>('');
   const [mergeModalVisible, setMergeModalVisible] = useState<boolean>(false);
-  // File name input custom dialog (replaces Alert.prompt)
+
+  // File name dialog
   const [nameDialogVisible, setNameDialogVisible] = useState<boolean>(false);
   const [nameDialogTitle, setNameDialogTitle] = useState<string>('');
   const [nameDialogValue, setNameDialogValue] = useState<string>('');
   const [nameDialogCallback, setNameDialogCallback] = useState<((name: string) => void) | null>(null);
 
-  // Data
+  // PDF Merge data
   const [pdfFiles, setPdfFiles] = useState<string[]>([]);
   const [file1, setFile1] = useState<string>('');
   const [file2, setFile2] = useState<string>('');
   const [mergedName, setMergedName] = useState<string>('');
 
-  const captureImageForProcessing = async (_options: any = {}): Promise<string[]> => {
+  const captureImageForProcessing = async (): Promise<string[]> => {
     try {
-      const PERM_KEY = '@camscanner_cam_perm';
-      const cachedPerm = await Storage.getItem(PERM_KEY);
+      const cachedPerm = await Storage.getItem(STORAGE_KEYS.CAM_PERM);
       let granted = cachedPerm === 'granted';
 
       if (!granted) {
         const perm = await ImagePicker.getCameraPermissionsAsync();
         if (perm.granted) {
           granted = true;
-          await Storage.setItem(PERM_KEY, 'granted');
+          await Storage.setItem(STORAGE_KEYS.CAM_PERM, 'granted');
         } else if (perm.canAskAgain) {
           const result = await ImagePicker.requestCameraPermissionsAsync();
           granted = result.granted;
-          if (granted) await Storage.setItem(PERM_KEY, 'granted');
+          if (granted) await Storage.setItem(STORAGE_KEYS.CAM_PERM, 'granted');
         }
       }
 
       if (!granted) {
-        Alert.alert('C\u1ea7n quy\u1ec1n Camera', 'Vui l\u00f2ng c\u1ea5p quy\u1ec1n m\u00e1y \u1ea3nh trong C\u00e0i \u0111\u1eb7t h\u1ec7 th\u1ed1ng.');
+        Alert.alert('Cần quyền Camera', 'Vui lòng cấp quyền máy ảnh trong Cài đặt hệ thống.');
         return [];
       }
 
@@ -75,26 +88,25 @@ export default function ToolsScreen({ route }: any) {
         }
         return [];
       } catch {
-        // Fallback gallery n\u1ebfu kh\u00f4ng c\u00f3 camera
         const lib = await ImagePicker.launchImageLibraryAsync({ quality: 1, allowsEditing: true });
         if (!lib.canceled && lib.assets && lib.assets.length > 0) {
           return [lib.assets[0].uri];
         }
         return [];
       }
-    } catch (e) {
+    } catch {
       return [];
     }
   };
 
-
-
   const loadSavedPdfs = async () => {
     try {
       const allFiles = await listDocumentFiles(['.pdf']);
-      setPdfFiles(allFiles.filter(f => f.endsWith('.pdf')));
+      if (isMounted.current) {
+        setPdfFiles(allFiles.filter(f => f.endsWith('.pdf')));
+      }
     } catch (e) {
-      console.log('Error listing files', e);
+      console.warn('[Tools] Error listing PDF files', e);
     }
   };
 
@@ -103,6 +115,7 @@ export default function ToolsScreen({ route }: any) {
       const action = route.params.triggerAction;
       navigation.setParams({ triggerAction: null });
       setTimeout(() => {
+        if (!isMounted.current) return;
         if (action === 'idCard') handleIdCardScan();
         else if (action === 'book') handleBookScan();
         else if (action === 'ocr') handleExtractText();
@@ -114,8 +127,7 @@ export default function ToolsScreen({ route }: any) {
     }
   }, [route.params?.triggerAction]);
 
-  // ====== CUSTOM NAME DIALOG (Replaces Alert.prompt for Android) ======
-  const showNameDialog = (title: string, placeholder: string, defaultName: string, onConfirm: (name: string) => void) => {
+  const showNameDialog = (title: string, defaultName: string, onConfirm: (name: string) => void) => {
     setNameDialogTitle(title);
     setNameDialogValue(defaultName);
     setNameDialogCallback(() => onConfirm);
@@ -129,664 +141,561 @@ export default function ToolsScreen({ route }: any) {
     setNameDialogVisible(false);
   };
 
-  // ====== SMART SCAN ======
+  // 1. SMART SCAN
   const handleSmartScan = () => {
     navigation.navigate('Scanner', { autoScan: true });
   };
 
-  // ====== ID CARDS SCAN ======
+  // 2. ID CARDS SCAN
   const handleIdCardScan = async () => {
     try {
-      const scannedImages = await captureImageForProcessing({ maxNumDocuments: 2 });
-      if (scannedImages && scannedImages.length >= 2) {
-        const frontUri = scannedImages[0];
-        const backUri = scannedImages[1];
-        showNameDialog(
-          'Đặt tên file ID Card',
-          'Nhập tên tài liệu',
-          'IDCard_' + Math.floor(Date.now() / 1000),
-          async (fileName) => {
-            const docName = fileName || 'IDCard_' + Math.floor(Date.now() / 1000);
-            try {
-              const html = `<!DOCTYPE html>
-                <html><head><style>@page{margin:0;size:2480px 3508px;}body{margin:0;padding:0;background:white;}</style></head>
-                  <body>
-                    <div style="width:2480px;height:1754px;display:flex;justify-content:center;align-items:center;background:white;">
-                      <div style="text-align:center;">
-                        <img src="${frontUri}" style="width:1664px;height:1040px;object-fit:contain;border:4px solid #ccc;border-radius:32px;" />
-                        <p style="font-size:45px;color:#666;margin-top:24px;">Mặt trước (Front)</p>
-                      </div>
-                    </div>
-                    <div style="width:2480px;height:1754px;display:flex;justify-content:center;align-items:center;background:white;">
-                      <div style="text-align:center;">
-                        <img src="${backUri}" style="width:1664px;height:1040px;object-fit:contain;border:4px solid #ccc;border-radius:32px;" />
-                        <p style="font-size:45px;color:#666;margin-top:24px;">Mặt sau (Back)</p>
-                      </div>
-                    </div>
-                  </body>
-                </html>`;
-              const { uri } = await Print.printToFileAsync({ html });
-              const safeName = docName.replace(/[^a-zA-Z0-9_-]/g, '_');
-              const targetUri = await savePdfToDocuments(uri, safeName);
-              Alert.alert('✅ Thành công', `Đã lưu ID Card: ${safeName}.pdf`, [
-                { text: 'Xem tài liệu', onPress: () => navigation.navigate('Files') },
-                { text: 'OK', style: 'cancel' }
+      Alert.alert(
+        'Quét Thẻ ID 2 mặt',
+        'Bước 1: Chụp MẶT TRƯỚC của thẻ.\nBước 2: Chụp MẶT SAU của thẻ.',
+        [
+          { text: 'Hủy', style: 'cancel' },
+          {
+            text: 'Bắt đầu',
+            onPress: async () => {
+              const front = await captureImageForProcessing();
+              if (front.length === 0) return;
+              Alert.alert('Mặt trước hoàn tất', 'Bây giờ hãy chụp tiếp MẶT SAU của thẻ.', [
+                {
+                  text: 'Chụp mặt sau',
+                  onPress: async () => {
+                    const back = await captureImageForProcessing();
+                    if (back.length === 0) return;
+
+                    showNameDialog(
+                      'Đặt tên tài liệu Thẻ ID',
+                      `IDCard_${Math.floor(Date.now() / 1000)}`,
+                      async (fileName) => {
+                        setLoadingText('Đang tạo PDF Thẻ ID...');
+                        setLoading(true);
+                        try {
+                          const targetUri = await PdfToolsService.createIdCardPdf(
+                            front[0],
+                            back[0],
+                            fileName
+                          );
+                          setLoading(false);
+                          Alert.alert('✅ Thành công', 'Đã lưu PDF Thẻ ID hoàn chỉnh!', [
+                            { text: 'Xem tài liệu', onPress: () => navigation.navigate('Files') },
+                            { text: 'OK', style: 'cancel' }
+                          ]);
+                        } catch {
+                          setLoading(false);
+                          Alert.alert('Lỗi', 'Không thể tạo file PDF Thẻ ID.');
+                        }
+                      }
+                    );
+                  }
+                }
               ]);
-            } catch (e) {
-              Alert.alert('Lỗi', 'Không thể tạo PDF ID Card');
             }
           }
-        );
-      } else if (scannedImages && scannedImages.length > 0) {
-        Alert.alert('Lỗi', 'Vui lòng quét đủ 2 mặt (Mặt trước & Mặt sau) của thẻ ID!');
-      }
-    } catch (error) {
-      Alert.alert('Lỗi', 'Không thể khởi chạy máy quét thẻ ID.');
+        ]
+      );
+    } catch {
+      Alert.alert('Lỗi', 'Không thể khởi chạy máy ảnh.');
     }
   };
 
-  // ====== BOOK SCAN (Smart Spine Detection & Dewarping Pro) ======
+  // 3. BOOK SCAN (Tách trang đôi)
   const handleBookScan = async () => {
     try {
-      const scannedImages = await captureImageForProcessing({});
+      const scannedImages = await captureImageForProcessing();
       if (scannedImages && scannedImages.length > 0) {
         const bookUri = scannedImages[0];
         showNameDialog(
-          'Đặt tên file Book Scan Pro',
-          'Nhập tên tài liệu sách',
-          'Book_' + Math.floor(Date.now() / 1000),
+          'Đặt tên file sách tách trang',
+          `Book_${Math.floor(Date.now() / 1000)}`,
           async (fileName) => {
-            const docName = fileName || 'Book_' + Math.floor(Date.now() / 1000);
+            setLoadingText('Đang tách trang sách thành PDF...');
+            setLoading(true);
             try {
-              const html = `<!DOCTYPE html>
-                <html>
-                  <head>
-                    <style>
-                      @page{margin:0;size:2480px 3508px;}
-                      body{margin:0;padding:0;background:white;}
-                      .page-box { width:2480px; height:3508px; overflow:hidden; position:relative; page-break-after:always; }
-                      .page-img { width:100%; height:100%; object-fit:cover; position:absolute; top:0; }
-                    </style>
-                  </head>
-                  <body>
-                    <div style="display:none;"><img id="srcImg" src="${bookUri}" /></div>
-                    <div class="page-box">
-                      <img id="imgPage1" class="page-img" style="left:0;" src="${bookUri}" />
-                    </div>
-                    <div class="page-box">
-                      <img id="imgPage2" class="page-img" style="left:0;" src="${bookUri}" />
-                    </div>
-                    <script>
-                      window.onload = function() {
-                        try {
-                          const img = document.getElementById('srcImg');
-                          const w = img.naturalWidth || 800;
-                          const h = img.naturalHeight || 600;
-                          
-                          const canvas = document.createElement('canvas');
-                          canvas.width = Math.min(400, w);
-                          canvas.height = Math.min(600, h);
-                          const ctx = canvas.getContext('2d');
-                          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-                          const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-
-                          let minSum = Infinity;
-                          let spineX = Math.floor(canvas.width * 0.5);
-                          for (let x = Math.floor(canvas.width * 0.35); x <= Math.floor(canvas.width * 0.65); x++) {
-                            let sum = 0;
-                            for (let y = Math.floor(canvas.height * 0.1); y < Math.floor(canvas.height * 0.9); y += 4) {
-                              const idx = (y * canvas.width + x) * 4;
-                              sum += (0.299 * imgData[idx] + 0.587 * imgData[idx+1] + 0.114 * imgData[idx+2]);
-                            }
-                            if (sum < minSum) { minSum = sum; spineX = x; }
-                          }
-                          const spineRatio = spineX / canvas.width;
-                          
-                          const imgP1 = document.getElementById('imgPage1');
-                          const imgP2 = document.getElementById('imgPage2');
-                          
-                          if (imgP1) {
-                            imgP1.style.width = (100 / spineRatio) + '%';
-                            imgP1.style.left = '0%';
-                          }
-                          if (imgP2) {
-                            imgP2.style.width = (100 / (1 - spineRatio)) + '%';
-                            imgP2.style.left = '-' + (spineRatio / (1 - spineRatio) * 100) + '%';
-                          }
-                        } catch(e) {}
-                      };
-                    </script>
-                  </body>
-                </html>`;
-              const { uri } = await Print.printToFileAsync({ html });
-              const safeName = docName.replace(/[^a-zA-Z0-9_-]/g, '_');
-              const targetUri = await savePdfToDocuments(uri, safeName);
-              Alert.alert('✅ Thành công (Smart Book Dewarping)', `Đã dò tìm gáy sách chính xác và tách thành 2 trang PDF: ${safeName}.pdf`, [
+              await PdfToolsService.createSplitBookPdf(bookUri, fileName);
+              setLoading(false);
+              Alert.alert('✅ Thành công', 'Đã tách trang sách đôi thành 2 trang PDF riêng biệt!', [
                 { text: 'Xem tài liệu', onPress: () => navigation.navigate('Files') },
                 { text: 'OK', style: 'cancel' }
               ]);
-            } catch (e) {
-              Alert.alert('Lỗi', 'Không thể tạo PDF tách trang sách');
+            } catch {
+              setLoading(false);
+              Alert.alert('Lỗi', 'Không thể tạo PDF tách trang sách.');
             }
           }
         );
       }
-    } catch (e) {
-      Alert.alert('Lỗi', 'Không thể khởi chạy Book Scanner.');
+    } catch {
+      Alert.alert('Lỗi', 'Không thể khởi chạy máy quét sách.');
     }
   };
 
-  // OCR qua Gemini Vision API
-  const ocrViaGemini = async (imageUri: string): Promise<string> => {
-    const b64 = await FileSystem.readAsStringAsync(imageUri, { encoding: FileSystem.EncodingType.Base64 });
-    return await GeminiService.ocrImage(b64);
-  };
-
+  // 4. OCR NHẬN DIỆN CHỮ
   const handleExtractText = async () => {
+    const apiKey = await GeminiService.getApiKey();
+    if (!apiKey) {
+      Alert.alert(
+        '⚠️ Cần Gemini API Key',
+        'Tính năng nhận diện chữ viết (OCR) sử dụng trí tuệ nhân tạo Gemini Multimodal Vision API.\n\nVui lòng vào tab "Cài đặt" để nhập API Key cá nhân miễn phí của bạn.',
+        [
+          { text: 'Đến Cài đặt', onPress: () => navigation.navigate('Me') },
+          { text: 'Để sau', style: 'cancel' }
+        ]
+      );
+      return;
+    }
+
     try {
-      const scannedImages = await captureImageForProcessing({});
+      const scannedImages = await captureImageForProcessing();
       if (scannedImages && scannedImages.length > 0) {
-        setLoadingText('AI đang trích xuất văn bản...');
+        setLoadingText('AI đang nhận dạng chữ viết...');
         setLoading(true);
-        let text = '';
         try {
-          text = await ocrViaGemini(scannedImages[0]);
-        } catch (e: any) {
+          const text = await GeminiService.ocrImage(scannedImages[0]);
+          if (!isMounted.current) return;
           setLoading(false);
-          Alert.alert('⚠️ Lỗi OCR', e.message || 'Vui lòng kiểm tra lại API Key trong tab Cài đặt.');
-          return;
+          setOcrResultText(text || 'Không nhận diện được văn bản trong ảnh.');
+          setOcrModalVisible(true);
+        } catch (e: any) {
+          if (!isMounted.current) return;
+          setLoading(false);
+          Alert.alert('⚠️ Lỗi OCR', e.message || 'Không thể trích xuất văn bản.');
         }
-        setOcrResultText(text || 'Không tìm thấy chữ trong hình.');
-        setLoading(false);
-        setOcrModalVisible(true);
       }
-    } catch (e) {
+    } catch {
       setLoading(false);
-      Alert.alert('Lỗi', 'Không khởi chạy được máy ảnh.');
+      Alert.alert('Lỗi', 'Không thể mở máy ảnh.');
     }
   };
 
-  // ====== AI SOLVER (Multimodal Vision & CAS Algebra Engine) ======
-  const handleAiSolver = async () => {
+  // 5. AI SOLVER & CAS ALGEBRA
+  const solveViaCamera = async () => {
     try {
-      const scannedImages = await captureImageForProcessing({});
+      const scannedImages = await captureImageForProcessing();
       if (scannedImages && scannedImages.length > 0) {
-        setLoadingText('AI đang phân tích & giải bài toán...');
+        setLoadingText('Đang phân tích bài toán...');
         setLoading(true);
         const imageUri = scannedImages[0];
-        
-        let equation = '';
-        try {
-          equation = await ocrViaGemini(imageUri);
-        } catch {
-          // Bỏ qua nếu chưa có API key để Gemini giải trực tiếp
-        }
-
-        let localSolution = '';
-        if (equation) {
-          const casResult = MathSolverService.solveWithCas(equation);
-          if (casResult.success) {
-            localSolution = `${casResult.result}\n\n`;
-          }
-        }
 
         const apiKey = await GeminiService.getApiKey();
-        if (!apiKey) {
-          if (localSolution) {
-            setSolverResult(`${localSolution}💡 Để phân tích hình vẽ & sơ đồ nâng cao, hãy nhập Gemini API Key trong Cài đặt.`);
-          } else {
-            setSolverResult(`📌 Nhận dạng văn bản (On-Device):\n${equation}\n\n💡 Để dùng AI Vision giải toán phức tạp, hãy nhập Gemini API Key trong Cài đặt.`);
-          }
-        } else {
+        if (apiKey) {
           try {
-            const ImageManipulator = require('expo-image-manipulator');
-            const compressed = await ImageManipulator.manipulateAsync(
-              imageUri,
-              [{ resize: { width: 800 } }],
-              { compress: 0.75, format: ImageManipulator.SaveFormat.JPEG }
-            );
-            const base64Data = await FileSystem.readAsStringAsync(compressed.uri, { encoding: FileSystem.EncodingType.Base64 });
-            const prompt = "Bạn là chuyên gia giải toán & phân tích hình ảnh AI. Hãy giải chi tiết bài toán/câu hỏi trong ảnh này (bao gồm cả hình vẽ hình học, sơ đồ, hệ phương trình nếu có). Hãy liệt kê từng bước suy luận (Step-by-step) bằng tiếng Việt rõ ràng, kèm công thức toán Unicode/LaTeX và đáp án cuối cùng.";
-            
-            const aiText = await GeminiService.generateContentWithImage(prompt, base64Data);
-            setSolverResult(`🤖 Gemini Vision Solver Pro:\n\n${aiText}`);
+            const aiText = await GeminiService.solveMathProblem(imageUri);
+            if (!isMounted.current) return;
+            setLoading(false);
+            setSolverResult(aiText);
+            setSolverModalVisible(true);
+            return;
           } catch (aiErr: any) {
-            if (localSolution) {
-              setSolverResult(`${localSolution}⚠️ Lỗi kết nối Gemini: ${aiErr.message || String(aiErr)}`);
-            } else {
-              setSolverResult(`⚠️ Lỗi phân tích: ${aiErr.message || String(aiErr)}`);
-            }
+            console.warn('[Tools] Gemini solver error:', aiErr);
           }
         }
 
+        // Nếu không có API Key, thông báo hướng dẫn rõ ràng
         setLoading(false);
+        setSolverResult(
+          '💡 Để giải bài toán qua hình ảnh (kèm sơ đồ hình học, phương trình), vui lòng nhập Gemini API Key trong tab Cài đặt.\n\nHoặc bạn có thể chọn "Nhập biểu thức" để giải phương trình/tính toán offline bằng bộ giải CAS trên thiết bị.'
+        );
         setSolverModalVisible(true);
       }
-    } catch (e) {
+    } catch {
       setLoading(false);
-      Alert.alert('Lỗi', 'Lỗi khi khởi chạy máy ảnh hoặc xử lý bài toán.');
+      Alert.alert('Lỗi', 'Lỗi khi khởi chạy máy ảnh.');
     }
   };
 
-  // ====== TRANSLATE ======
+  const handleAiSolver = () => {
+    Alert.alert(
+      '🧮 Bộ giải toán thông minh',
+      'Chọn phương thức giải bài toán:',
+      [
+        { text: 'Hủy', style: 'cancel' },
+        {
+          text: '⌨️ Nhập biểu thức (Offline CAS)',
+          onPress: () => {
+            showNameDialog(
+              'Nhập biểu thức đại số / phương trình',
+              '2x + 10 = 30',
+              (equation) => {
+                if (!equation.trim()) return;
+                const casRes = MathSolverService.solveWithCas(equation.trim());
+                setSolverResult(casRes.result);
+                setSolverModalVisible(true);
+              }
+            );
+          },
+        },
+        {
+          text: '📷 Chụp ảnh bài toán (AI Vision)',
+          onPress: solveViaCamera,
+        },
+      ]
+    );
+  };
+
+  // 6. DỊCH THUẬT
   const handleTranslate = async () => {
     try {
-      const scannedImages = await captureImageForProcessing({});
+      const scannedImages = await captureImageForProcessing();
       if (scannedImages && scannedImages.length > 0) {
-        setLoadingText('Đang dịch thuật...');
+        const apiKey = await GeminiService.getApiKey();
+        if (!apiKey) {
+          Alert.alert(
+            '⚠️ Cần API Key',
+            'Tính năng dịch ảnh yêu cầu Gemini Vision OCR để nhận dạng văn bản trước khi dịch.\n\nVui lòng cấu hình API Key trong tab Cài đặt.',
+            [{ text: 'Cài đặt', onPress: () => navigation.navigate('Me') }, { text: 'Đóng', style: 'cancel' }]
+          );
+          return;
+        }
+
+        setLoadingText('Đang trích xuất & dịch thuật...');
         setLoading(true);
-        let text = '';
         try {
-          text = await ocrViaGemini(scannedImages[0]);
-        } catch {
-          setLoading(false);
-          Alert.alert('⚠️ Cần API Key', 'Vui lòng nhập Gemini API Key trong tab Cài đặt.');
-          return;
-        }
-        if (!text) {
-          setLoading(false);
-          Alert.alert('Lỗi', 'Không nhận dạng được văn bản.');
-          return;
-        }
-
-        setTranslateOriginal(text);
-        const translated = await TranslationService.translate(text);
-        setTranslateResult(translated);
-        setLoading(false);
-        setTranslateModalVisible(true);
-      }
-    } catch (e: any) {
-      setLoading(false);
-      Alert.alert('Lỗi', e.message || 'Có lỗi kết nối mạng.');
-    }
-  };
-
-  // ====== REAL FORMAT CONVERSION ======
-  const handleFormatConvert = async (format: string) => {
-    try {
-      const scannedImages = await captureImageForProcessing({});
-      if (scannedImages && scannedImages.length > 0) {
-        const { Document, Packer, Paragraph, TextRun } = require('docx');
-        const XLSX = require('xlsx');
-        setLoadingText(`Đang chuyển đổi sang ${format}...`);
-        setLoading(true);
-        let text = '';
-        try { text = await ocrViaGemini(scannedImages[0]); } catch {
-          setLoading(false);
-          Alert.alert('⚠️ Cần API Key', 'Vui lòng nhập Gemini API Key trong tab Cài đặt để dùng tính năng này.');
-          return;
-        }
-        
-        if (!text) {
-          setLoading(false);
-          Alert.alert('Thông báo', 'Không tìm thấy chữ để chuyển đổi.');
-          return;
-        }
-
-        const safeName = format + '_' + Math.floor(Date.now() / 1000);
-        let finalUri = '';
-
-        if (format === 'Word') {
-          const doc = new Document({
-            sections: [{
-              properties: {},
-              children: text.split('\n').map((line: string) => new Paragraph({ children: [new TextRun(line)] }))
-            }]
-          });
-          const b64 = await Packer.toBase64String(doc);
-          finalUri = await saveBase64ToDocuments(b64, safeName + '.docx');
-        } else if (format === 'Excel') {
-          const rows = text.split('\n').map((line: string) => line.split(/[\s\t]+/));
-          const ws = XLSX.utils.aoa_to_sheet(rows);
-          const wb = XLSX.utils.book_new();
-          XLSX.utils.book_append_sheet(wb, ws, "Data");
-          const wbout = XLSX.write(wb, { type: 'base64', bookType: 'xlsx' });
-          finalUri = await saveBase64ToDocuments(wbout, safeName + '.xlsx');
-        }
-
-        setLoading(false);
-        Alert.alert('✅ Thành công', `Đã lưu file ${safeName}.${format === 'Word' ? 'docx' : 'xlsx'}`, [
-          { text: 'Chia sẻ', onPress: () => Sharing.shareAsync(finalUri) },
-          { text: 'Đóng', style: 'cancel' }
-        ]);
-      }
-    } catch (e: any) {
-      setLoading(false);
-      // Chỉ log chi tiết phía console — KHÔNG lộ e.message ra ngoài cho người dùng
-      console.error('[UI] Format convert error:', e?.message || e);
-      Alert.alert('Lỗi', `Không thể chuyển đổi sang ${format}. Vui lòng thử lại.`);
-    }
-  };
-
-  // ====== IMPORT IMAGES ======
-  const handleImportImage = async () => {
-    let result = await ImagePicker.launchImageLibraryAsync({ 
-      mediaTypes: ['images'] as any,
-      allowsMultipleSelection: true,
-      quality: 1
-    });
-    if (!result.canceled && result.assets && result.assets.length > 0) {
-      const uris = result.assets.map(asset => asset.uri);
-      navigation.navigate('Scanner', { importImages: uris });
-    }
-  };
-
-  // ====== IMPORT PDF ======
-  const handleImportPdf = async () => {
-    try {
-      let result = await DocumentPicker.getDocumentAsync({ type: 'application/pdf' });
-      if (!result.canceled && result.assets && result.assets.length > 0) {
-        const sourceUri = result.assets[0].uri;
-        const originalName = result.assets[0].name;
-        showNameDialog(
-          'Nhập file PDF',
-          'Đặt tên cho file PDF',
-          originalName.replace('.pdf', ''),
-          async (fileName) => {
-            const docName = fileName || originalName.replace('.pdf', '');
-            const safeName = docName.replace(/[^a-zA-Z0-9_-]/g, '_');
-            const targetUri = await copyFileToDocuments(sourceUri, safeName + '.pdf');
-            Alert.alert('✅ Thành công', `Đã nhập file PDF: ${safeName}.pdf`);
+          const rawText = await GeminiService.ocrImage(scannedImages[0]);
+          if (!rawText.trim()) {
+            setLoading(false);
+            Alert.alert('Thông báo', 'Không tìm thấy chữ trong ảnh để dịch.');
+            return;
           }
-        );
+          setTranslateOriginal(rawText);
+          const translated = await TranslationService.translate(rawText);
+          if (!isMounted.current) return;
+          setLoading(false);
+          setTranslateResult(translated);
+          setTranslateModalVisible(true);
+        } catch (err: any) {
+          if (!isMounted.current) return;
+          setLoading(false);
+          Alert.alert('Lỗi dịch thuật', err.message || 'Không thể dịch nội dung.');
+        }
       }
-    } catch (e) {
-      Alert.alert('Lỗi', 'Không thể chọn hoặc nhập file PDF.');
+    } catch {
+      setLoading(false);
+      Alert.alert('Lỗi', 'Lỗi khởi chạy máy ảnh.');
     }
   };
 
-  // ====== MERGE PDF (REAL MERGE using pdf-lib) ======
-  const handleOpenMergeDialog = () => {
-    loadSavedPdfs();
-    setMergedName('Merge_' + Math.floor(Date.now() / 1000));
+  // 7. XUẤT OFFICE (Word & Excel)
+  const handleFormatConvert = async (format: 'Word' | 'Excel') => {
+    const apiKey = await GeminiService.getApiKey();
+    if (!apiKey) {
+      Alert.alert(
+        '⚠️ Cần Gemini API Key',
+        `Để trích xuất nội dung từ ảnh sang file ${format}, cần Gemini Vision OCR.\n\nVui lòng nhập API Key trong tab Cài đặt.`,
+        [{ text: 'Cài đặt', onPress: () => navigation.navigate('Me') }, { text: 'Đóng', style: 'cancel' }]
+      );
+      return;
+    }
+
+    try {
+      const scannedImages = await captureImageForProcessing();
+      if (scannedImages && scannedImages.length > 0) {
+        setLoadingText(`AI đang đọc và tạo file ${format}...`);
+        setLoading(true);
+        try {
+          const text = await GeminiService.ocrImage(scannedImages[0]);
+          if (!text.trim()) {
+            setLoading(false);
+            Alert.alert('Thông báo', 'Không tìm thấy chữ trong ảnh để chuyển đổi.');
+            return;
+          }
+
+          let finalUri = '';
+          if (format === 'Word') {
+            finalUri = await OfficeExportService.exportToWord(text);
+          } else {
+            finalUri = await OfficeExportService.exportToExcel(text);
+          }
+
+          if (!isMounted.current) return;
+          setLoading(false);
+          Alert.alert('✅ Thành công', `Đã tạo file ${format} thành công!`, [
+            { text: 'Chia sẻ', onPress: () => Sharing.shareAsync(finalUri) },
+            { text: 'Xem tài liệu', onPress: () => navigation.navigate('Files') },
+            { text: 'Đóng', style: 'cancel' }
+          ]);
+        } catch (err: any) {
+          if (!isMounted.current) return;
+          setLoading(false);
+          Alert.alert('Lỗi chuyển đổi', err.message || `Không thể tạo file ${format}.`);
+        }
+      }
+    } catch {
+      setLoading(false);
+      Alert.alert('Lỗi', 'Không thể chụp ảnh.');
+    }
+  };
+
+  // 8. GỘP PDF
+  const handleOpenMergeDialog = async () => {
+    await loadSavedPdfs();
     setMergeModalVisible(true);
   };
 
-  const handleMergePdf = async () => {
-    if (!file1 || !file2 || file1 === file2) {
-      Alert.alert('Lỗi', 'Vui lòng chọn 2 tài liệu PDF khác nhau để gộp!');
+  const handleMergePdfs = async () => {
+    if (!file1 || !file2) {
+      Alert.alert('Lỗi', 'Vui lòng chọn đủ 2 file PDF để gộp!');
       return;
     }
-    if (!mergedName.trim()) {
-      Alert.alert('Lỗi', 'Vui lòng nhập tên file kết quả!');
+    if (file1 === file2) {
+      Alert.alert('Lỗi', 'Vui lòng chọn 2 file khác nhau!');
       return;
     }
 
+    setMergeModalVisible(false);
+    setLoadingText('Đang gộp PDF...');
+    setLoading(true);
     try {
-      setLoadingText('Đang gộp PDF...');
-      setLoading(true);
-
-      const docDir = getDocumentDirectory();
-      const uri1 = docDir + file1;
-      const uri2 = docDir + file2;
-
-      // Read both PDF files as base64
-      const pdf1Bytes = await FileSystem.readAsStringAsync(uri1, { encoding: FileSystem.EncodingType.Base64 });
-      const pdf2Bytes = await FileSystem.readAsStringAsync(uri2, { encoding: FileSystem.EncodingType.Base64 });
-
-      // Load both PDF documents
-      const { PDFDocument } = require('pdf-lib');
-      const pdf1Doc = await PDFDocument.load(pdf1Bytes);
-      const pdf2Doc = await PDFDocument.load(pdf2Bytes);
-
-      // Create a new PDF and copy all pages from both
-      const mergedPdf = await PDFDocument.create();
-      const pages1 = await mergedPdf.copyPages(pdf1Doc, pdf1Doc.getPageIndices());
-      pages1.forEach((page: any) => mergedPdf.addPage(page));
-      const pages2 = await mergedPdf.copyPages(pdf2Doc, pdf2Doc.getPageIndices());
-      pages2.forEach((page: any) => mergedPdf.addPage(page));
-
-      // Save merged PDF
-      const mergedBytes = await mergedPdf.save();
-      const base64Data = arrayBufferToBase64(mergedBytes.buffer as any);
-
-      const safeName = mergedName.replace(/[^a-zA-Z0-9_-]/g, '_');
-      const targetUri = await saveBase64ToDocuments(base64Data, safeName + '.pdf');
-
+      const outName = mergedName.trim() || `Merged_${Date.now()}`;
+      await PdfToolsService.mergePdfs([file1, file2], outName);
       setLoading(false);
-      setMergeModalVisible(false);
-      Alert.alert('✅ Thành công', `Đã gộp ${pages1.length + pages2.length} trang thành file ${safeName}.pdf!`, [
+      Alert.alert('✅ Thành công', 'Đã gộp 2 file PDF thành công!', [
         { text: 'Xem tài liệu', onPress: () => navigation.navigate('Files') },
-        { text: 'Đóng', style: 'cancel' }
+        { text: 'OK', style: 'cancel' }
       ]);
-    } catch (e) {
+    } catch (e: any) {
       setLoading(false);
-      Alert.alert('Lỗi', 'Có lỗi xảy ra khi gộp tệp PDF.');
+      Alert.alert('Lỗi', `Không thể gộp PDF: ${e.message || String(e)}`);
     }
   };
 
-  const arrayBufferToBase64 = (buffer: ArrayBuffer) => {
-    let binary = '';
-    const bytes = new Uint8Array(buffer);
-    for (let i = 0; i < bytes.byteLength; i++) {
-      binary += String.fromCharCode(bytes[i]);
+  // 9. NHẬP FILE VÀ ẢNH
+  const handleImportImage = async () => {
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ['images'],
+      allowsMultipleSelection: true,
+      quality: 1,
+    });
+    if (!result.canceled && result.assets && result.assets.length > 0) {
+      navigation.navigate('Scanner', { importImages: result.assets.map(a => a.uri) });
     }
-    return btoa(binary);
   };
 
-  const copyToClipboard = async (text: string) => {
-    await Clipboard.setStringAsync(text);
-    Alert.alert('✅ Đã sao chép', 'Nội dung đã được sao chép vào bộ nhớ tạm.');
+  const handleImportPdf = async () => {
+    try {
+      const result = await DocumentPicker.getDocumentAsync({ type: 'application/pdf' });
+      if (!result.canceled && result.assets && result.assets.length > 0) {
+        navigation.navigate('Files');
+      }
+    } catch {
+      Alert.alert('Lỗi', 'Không thể nhập file PDF.');
+    }
   };
+
+  const toolsList = [
+    { title: 'Quét Thường', icon: 'scan', color: theme.accent, desc: 'Chụp và chỉnh sửa trang văn bản chuẩn A4', action: handleSmartScan },
+    { title: 'Thẻ ID 2 mặt', icon: 'card', color: theme.blue, desc: 'Ghép mặt trước và mặt sau trên cùng 1 trang', action: handleIdCardScan },
+    { title: 'Quét Sách Đôi', icon: 'book', color: '#ff7043', desc: 'Chụp đôi và tự động tách thành 2 trang riêng', action: handleBookScan },
+    { title: 'Nhận diện chữ OCR', icon: 'text', color: theme.green, desc: 'Trích xuất chữ viết bằng Google Gemini AI', action: handleExtractText },
+    { title: 'Giải Toán AI', icon: 'calculator', color: '#ab47bc', desc: 'Giải bài tập qua hình ảnh bằng Gemini Vision', action: handleAiSolver },
+    { title: 'Dịch thuật', icon: 'language', color: '#29b6f6', desc: 'Dịch trực tiếp văn bản từ hình ảnh tài liệu', action: handleTranslate },
+    { title: 'Chuyển sang Word', icon: 'document-text', color: '#1e88e5', desc: 'Nhận dạng và tạo file văn bản Microsoft Word (.docx)', action: () => handleFormatConvert('Word') },
+    { title: 'Chuyển sang Excel', icon: 'stats-chart', color: '#43a047', desc: 'Trích xuất bảng biểu sang Microsoft Excel (.xlsx)', action: () => handleFormatConvert('Excel') },
+    { title: 'Gộp nhiều PDF', icon: 'copy', color: theme.danger, desc: 'Ghép 2 hoặc nhiều file PDF thành 1 tập tin duy nhất', action: handleOpenMergeDialog },
+    { title: 'Quét mã QR', icon: 'qr-code', color: theme.warn, desc: 'Đọc thông tin QR code và Barcode bằng Camera', action: () => navigation.navigate('QRScanner') },
+    { title: 'Tạo mã QR', icon: 'create', color: '#8e24aa', desc: 'Tạo mã QR từ văn bản, liên kết hoặc số điện thoại', action: () => navigation.navigate('QRGenerator') },
+  ];
 
   return (
-    <View style={[styles.container, { backgroundColor: theme.bg }]}>
-      <View style={[styles.header, { backgroundColor: theme.headerBg, borderBottomColor: theme.border }]}>
-        <Text style={[styles.headerTitle, { color: theme.headerText }]}>Công cụ</Text>
+    <View style={[s.container, { backgroundColor: theme.bg }]}>
+      <View style={[s.header, { backgroundColor: theme.card, borderBottomColor: theme.border }]}>
+        <Text style={[s.headerTitle, { color: theme.text }]}>Hộp Công Cụ</Text>
+        <Text style={[s.headerSub, { color: theme.textSub }]}>Các tiện ích xử lý tài liệu thông minh</Text>
       </View>
-      <ScrollView contentContainerStyle={styles.content}>
-        
-        <Text style={[styles.sectionTitle, { color: theme.text }]}>📷 Quét Nâng Cao</Text>
-        <View style={[styles.grid, { backgroundColor: theme.card, borderColor: theme.border }]}>
-          <TouchableOpacity style={styles.item} onPress={handleSmartScan}>
-            <View style={[styles.itemIcon, { backgroundColor: theme.accent + '22' }]}><Ionicons name="scan" size={26} color={theme.accent} /></View>
-            <Text style={[styles.itemText, { color: theme.textSub }]}>Smart Scan</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.item} onPress={handleIdCardScan}>
-            <View style={[styles.itemIcon, { backgroundColor: theme.blue + '22' }]}><Ionicons name="card" size={26} color={theme.blue} /></View>
-            <Text style={[styles.itemText, { color: theme.textSub }]}>Thẻ ID</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.item} onPress={handleBookScan}>
-            <View style={[styles.itemIcon, { backgroundColor: theme.danger + '22' }]}><Ionicons name="book" size={26} color={theme.danger} /></View>
-            <Text style={[styles.itemText, { color: theme.textSub }]}>Quét Sách</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.item} onPress={() => navigation.navigate('QRScanner')}>
-            <View style={[styles.itemIcon, { backgroundColor: theme.warn + '22' }]}><Ionicons name="qr-code" size={26} color={theme.warn} /></View>
-            <Text style={[styles.itemText, { color: theme.textSub }]}>Quét QR/Mã vạch</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.item} onPress={() => navigation.navigate('QRGenerator')}>
-            <View style={[styles.itemIcon, { backgroundColor: '#7c3aed22' }]}><Ionicons name="create-outline" size={26} color="#7c3aed" /></View>
-            <Text style={[styles.itemText, { color: theme.textSub }]}>Tạo Mã QR</Text>
-          </TouchableOpacity>
-        </View>
 
-        <Text style={[styles.sectionTitle, { color: theme.text }]}>📂 Xử lý & Chỉnh sửa PDF</Text>
-        <View style={[styles.grid, { backgroundColor: theme.card, borderColor: theme.border }]}>
-          <TouchableOpacity style={styles.item} onPress={handleImportImage}>
-            <View style={[styles.itemIcon, { backgroundColor: '#3f51b522' }]}><Ionicons name="images" size={26} color="#3f51b5" /></View>
-            <Text style={[styles.itemText, { color: theme.textSub }]}>Import Ảnh</Text>
+      <ScrollView contentContainerStyle={s.listContainer} showsVerticalScrollIndicator={false}>
+        {toolsList.map((item, idx) => (
+          <TouchableOpacity
+            key={idx}
+            style={[s.toolCard, { backgroundColor: theme.card, borderColor: theme.border }]}
+            onPress={item.action}
+            activeOpacity={0.7}
+          >
+            <View style={[s.iconBox, { backgroundColor: item.color + '18' }]}>
+              <Ionicons name={item.icon as any} size={28} color={item.color} />
+            </View>
+            <View style={s.toolInfo}>
+              <Text style={[s.toolTitle, { color: theme.text }]}>{item.title}</Text>
+              <Text style={[s.toolDesc, { color: theme.textSub }]}>{item.desc}</Text>
+            </View>
+            <Ionicons name="chevron-forward" size={20} color={theme.textMuted} />
           </TouchableOpacity>
-          <TouchableOpacity style={styles.item} onPress={handleImportPdf}>
-            <View style={[styles.itemIcon, { backgroundColor: '#0288d122' }]}><Ionicons name="document-text" size={26} color="#0288d1" /></View>
-            <Text style={[styles.itemText, { color: theme.textSub }]}>Nhập PDF</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.item} onPress={handleOpenMergeDialog}>
-            <View style={[styles.itemIcon, { backgroundColor: theme.warn + '22' }]}><Ionicons name="git-merge" size={26} color={theme.warn} /></View>
-            <Text style={[styles.itemText, { color: theme.textSub }]}>Gộp PDF</Text>
-          </TouchableOpacity>
-        </View>
-
-        <Text style={[styles.sectionTitle, { color: theme.text }]}>🤖 Nhận dạng & Dịch (AI)</Text>
-        <View style={[styles.grid, { backgroundColor: theme.card, borderColor: theme.border }]}>
-          <TouchableOpacity style={styles.item} onPress={handleExtractText}>
-            <View style={[styles.itemIcon, { backgroundColor: theme.green + '22' }]}><Ionicons name="text" size={26} color={theme.green} /></View>
-            <Text style={[styles.itemText, { color: theme.textSub }]}>OCR</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.item} onPress={handleTranslate}>
-            <View style={[styles.itemIcon, { backgroundColor: '#8e24aa22' }]}><Ionicons name="language" size={26} color="#8e24aa" /></View>
-            <Text style={[styles.itemText, { color: theme.textSub }]}>Dịch tài liệu</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.item} onPress={handleAiSolver}>
-            <View style={[styles.itemIcon, { backgroundColor: '#fb8c0022' }]}><Ionicons name="calculator" size={26} color="#fb8c00" /></View>
-            <Text style={[styles.itemText, { color: theme.textSub }]}>Giải toán AI</Text>
-          </TouchableOpacity>
-        </View>
-
-        <Text style={[styles.sectionTitle, { color: theme.text }]}>🔄 Chuyển Đổi Định Dạng</Text>
-        <View style={[styles.grid, { backgroundColor: theme.card, borderColor: theme.border }]}>
-          <TouchableOpacity style={styles.item} onPress={() => handleFormatConvert('Word')}>
-            <View style={[styles.itemIcon, { backgroundColor: theme.blue + '22' }]}><Ionicons name="document-text-outline" size={26} color={theme.blue} /></View>
-            <Text style={[styles.itemText, { color: theme.textSub }]}>Sang Word</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.item} onPress={() => handleFormatConvert('Excel')}>
-            <View style={[styles.itemIcon, { backgroundColor: theme.green + '22' }]}><Ionicons name="stats-chart-outline" size={26} color={theme.green} /></View>
-            <Text style={[styles.itemText, { color: theme.textSub }]}>Sang Excel</Text>
-          </TouchableOpacity>
-        </View>
+        ))}
       </ScrollView>
 
-
-      {/* Loading overlay */}
-      {loading && (
-        <View style={styles.loadingOverlay}>
-          <ActivityIndicator size="large" color={theme.accent} />
-          <Text style={styles.loadingText}>{loadingText}</Text>
+      {/* Loading Modal */}
+      <Modal visible={loading} transparent animationType="fade">
+        <View style={s.modalOverlay}>
+          <View style={[s.loadingBox, { backgroundColor: theme.card }]}>
+            <ActivityIndicator size="large" color={theme.accent} />
+            <Text style={[s.loadingText, { color: theme.text }]}>{loadingText}</Text>
+          </View>
         </View>
-      )}
+      </Modal>
 
-      {/* Custom Name Dialog (replaces Alert.prompt for Android compatibility) */}
-      <Modal visible={nameDialogVisible} animationType="fade" transparent>
-        <View style={styles.modalBg}>
-          <View style={[styles.nameDialogContent, { backgroundColor: theme.card }]}>
-            <Text style={[styles.modalTitle, { color: theme.text }]}>{nameDialogTitle}</Text>
-            <TextInput 
-              style={[styles.nameDialogInput, { borderColor: theme.border, backgroundColor: theme.surface, color: theme.text }]}
+      {/* Custom Name Dialog */}
+      <Modal visible={nameDialogVisible} transparent animationType="fade">
+        <View style={s.modalOverlay}>
+          <View style={[s.dialogBox, { backgroundColor: theme.card }]}>
+            <Text style={[s.dialogTitle, { color: theme.text }]}>{nameDialogTitle}</Text>
+            <TextInput
+              style={[s.dialogInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
               value={nameDialogValue}
               onChangeText={setNameDialogValue}
-              placeholder="Nhập tên file"
-              placeholderTextColor={theme.textMuted}
               autoFocus
+              selectTextOnFocus
             />
-            <View style={styles.nameDialogActions}>
-              <TouchableOpacity style={[styles.nameDialogBtn, { backgroundColor: theme.surface }]} onPress={() => setNameDialogVisible(false)}>
-                <Text style={[styles.btnCancelText, { color: theme.textSub }]}>Hủy</Text>
+            <View style={s.dialogActions}>
+              <TouchableOpacity style={s.dialogBtn} onPress={() => setNameDialogVisible(false)}>
+                <Text style={{ color: theme.textSub }}>Hủy</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={[styles.nameDialogBtn, { backgroundColor: theme.accent }]} onPress={handleNameDialogConfirm}>
-                <Text style={styles.btnConfirmText}>Xác nhận</Text>
+              <TouchableOpacity style={[s.dialogBtn, { backgroundColor: theme.accent }]} onPress={handleNameDialogConfirm}>
+                <Text style={{ color: '#fff', fontWeight: 'bold' }}>Xác nhận</Text>
               </TouchableOpacity>
             </View>
           </View>
         </View>
       </Modal>
 
-      {/* OCR Modal */}
-      <Modal visible={ocrModalVisible} animationType="slide" transparent>
-        <View style={styles.modalBg}>
-          <View style={[styles.modalContent, { backgroundColor: theme.card }]}>
-            <Text style={[styles.modalTitle, { color: theme.text }]}>📝 Văn Bản Trích Xuất (OCR)</Text>
-            <ScrollView style={styles.modalBody}>
-              <Text style={[styles.modalText, { color: theme.textSub }]}>
-                {ocrResultText}
-              </Text>
-            </ScrollView>
-            <View style={styles.modalActions}>
-              <TouchableOpacity style={[styles.modalBtn, { backgroundColor: theme.surface }]} onPress={() => setOcrModalVisible(false)}>
-                <Text style={[styles.btnCancelText, { color: theme.textSub }]}>Đóng</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={[styles.modalBtn, { backgroundColor: theme.accent }]} onPress={() => copyToClipboard(ocrResultText)}>
-                <Text style={styles.btnConfirmText}>📋 Sao chép</Text>
+      {/* OCR Result Modal */}
+      <Modal visible={ocrModalVisible} transparent animationType="slide">
+        <View style={s.modalOverlay}>
+          <View style={[s.resultBox, { backgroundColor: theme.card }]}>
+            <View style={s.resultHeader}>
+              <Text style={[s.resultTitle, { color: theme.text }]}>📝 Kết quả nhận dạng chữ</Text>
+              <TouchableOpacity onPress={() => setOcrModalVisible(false)}>
+                <Ionicons name="close" size={24} color={theme.text} />
               </TouchableOpacity>
             </View>
+            <ScrollView style={s.resultScroll}>
+              <Text style={[s.resultContent, { color: theme.text }]} selectable>{ocrResultText}</Text>
+            </ScrollView>
+            <TouchableOpacity
+              style={[s.actionBtn, { backgroundColor: theme.accent }]}
+              onPress={async () => {
+                await Clipboard.setStringAsync(ocrResultText);
+                Alert.alert('Đã sao chép', 'Đã copy toàn bộ nội dung vào bộ nhớ tạm.');
+              }}
+            >
+              <Ionicons name="copy" size={18} color="#fff" style={{ marginRight: 8 }} />
+              <Text style={s.actionBtnText}>Sao chép văn bản</Text>
+            </TouchableOpacity>
           </View>
         </View>
       </Modal>
 
       {/* AI Solver Modal */}
-      <Modal visible={solverModalVisible} animationType="slide" transparent>
-        <View style={styles.modalBg}>
-          <View style={[styles.modalContent, { backgroundColor: theme.card }]}>
-            <Text style={[styles.modalTitle, { color: theme.text }]}>🧮 CS AI Solver</Text>
-            <ScrollView style={styles.modalBody}>
-              <Text style={[styles.modalText, { color: theme.textSub }]}>{solverResult}</Text>
+      <Modal visible={solverModalVisible} transparent animationType="slide">
+        <View style={s.modalOverlay}>
+          <View style={[s.resultBox, { backgroundColor: theme.card }]}>
+            <View style={s.resultHeader}>
+              <Text style={[s.resultTitle, { color: theme.text }]}>📐 Lời giải bài toán</Text>
+              <TouchableOpacity onPress={() => setSolverModalVisible(false)}>
+                <Ionicons name="close" size={24} color={theme.text} />
+              </TouchableOpacity>
+            </View>
+            <ScrollView style={s.resultScroll}>
+              <Text style={[s.resultContent, { color: theme.text }]} selectable>{solverResult}</Text>
             </ScrollView>
-            <TouchableOpacity style={[styles.modalBtn, { width: '100%', backgroundColor: theme.accent }]} onPress={() => setSolverModalVisible(false)}>
-              <Text style={styles.btnConfirmText}>Đồng ý</Text>
+            <TouchableOpacity
+              style={[s.actionBtn, { backgroundColor: theme.accent }]}
+              onPress={async () => {
+                await Clipboard.setStringAsync(solverResult);
+                Alert.alert('Đã sao chép', 'Đã copy lời giải vào bộ nhớ tạm.');
+              }}
+            >
+              <Ionicons name="copy" size={18} color="#fff" style={{ marginRight: 8 }} />
+              <Text style={s.actionBtnText}>Sao chép lời giải</Text>
             </TouchableOpacity>
           </View>
         </View>
       </Modal>
 
       {/* Translate Modal */}
-      <Modal visible={translateModalVisible} animationType="slide" transparent>
-        <View style={styles.modalBg}>
-          <View style={[styles.modalContent, { backgroundColor: theme.card }]}>
-            <Text style={[styles.modalTitle, { color: theme.text }]}>🌐 CS Translate</Text>
-            <ScrollView style={styles.modalBody}>
-              <Text style={[styles.modalText, { color: theme.textSub }]}>
-                <Text style={{ fontWeight: 'bold', color: theme.text }}>Văn bản gốc:</Text>{'\n'}
-                {translateOriginal}{'\n'}{'\n'}
-                <Text style={{ fontWeight: 'bold', color: theme.text }}>Bản dịch (Tiếng Việt):</Text>{'\n'}
-                {translateResult}
-              </Text>
-            </ScrollView>
-            <View style={styles.modalActions}>
-              <TouchableOpacity style={[styles.modalBtn, { backgroundColor: theme.surface }]} onPress={() => setTranslateModalVisible(false)}>
-                <Text style={[styles.btnCancelText, { color: theme.textSub }]}>Đóng</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={[styles.modalBtn, { backgroundColor: theme.accent }]} onPress={() => copyToClipboard(translateResult)}>
-                <Text style={styles.btnConfirmText}>📋 Sao chép</Text>
+      <Modal visible={translateModalVisible} transparent animationType="slide">
+        <View style={s.modalOverlay}>
+          <View style={[s.resultBox, { backgroundColor: theme.card }]}>
+            <View style={s.resultHeader}>
+              <Text style={[s.resultTitle, { color: theme.text }]}>🌐 Bản dịch tài liệu</Text>
+              <TouchableOpacity onPress={() => setTranslateModalVisible(false)}>
+                <Ionicons name="close" size={24} color={theme.text} />
               </TouchableOpacity>
             </View>
+            <ScrollView style={s.resultScroll}>
+              <Text style={[s.sectionHeader, { color: theme.textSub }]}>Văn bản gốc:</Text>
+              <Text style={[s.resultContent, { color: theme.textSub, marginBottom: 16 }]} selectable>{translateOriginal}</Text>
+              <Text style={[s.sectionHeader, { color: theme.accent }]}>Kết quả dịch:</Text>
+              <Text style={[s.resultContent, { color: theme.text }]} selectable>{translateResult}</Text>
+            </ScrollView>
+            <TouchableOpacity
+              style={[s.actionBtn, { backgroundColor: theme.accent }]}
+              onPress={async () => {
+                await Clipboard.setStringAsync(translateResult);
+                Alert.alert('Đã sao chép', 'Đã copy bản dịch vào bộ nhớ tạm.');
+              }}
+            >
+              <Ionicons name="copy" size={18} color="#fff" style={{ marginRight: 8 }} />
+              <Text style={s.actionBtnText}>Sao chép bản dịch</Text>
+            </TouchableOpacity>
           </View>
         </View>
       </Modal>
 
       {/* Merge PDF Modal */}
-      <Modal visible={mergeModalVisible} animationType="slide" transparent>
-        <View style={styles.modalBg}>
-          <View style={[styles.modalContent, { backgroundColor: theme.card }]}>
-            <Text style={[styles.modalTitle, { color: theme.text }]}>📎 Gộp tài liệu PDF</Text>
-            <View style={styles.modalBodyMerge}>
-              {pdfFiles.length < 2 ? (
-                <Text style={[styles.emptyText, { color: theme.warn }]}>Bạn cần có ít nhất 2 tài liệu PDF được lưu trong mục Tài liệu để thực hiện gộp.</Text>
-              ) : (
-                <View>
-                  <Text style={[styles.selectLabel, { color: theme.text }]}>Chọn tài liệu 1:</Text>
-                  <ScrollView style={[styles.selectBox, { borderColor: theme.border, backgroundColor: theme.surface }]}>
-                    {pdfFiles.map((file, idx) => (
-                      <TouchableOpacity key={idx} style={[styles.selectItem, { borderBottomColor: theme.border }, file1 === file && [styles.selectedItem, { backgroundColor: theme.accent + '22' }]]} onPress={() => setFile1(file)}>
-                        <Text style={[styles.selectText, { color: file1 === file ? theme.accent : theme.text }]}>{file}</Text>
-                      </TouchableOpacity>
-                    ))}
-                  </ScrollView>
+      <Modal visible={mergeModalVisible} transparent animationType="fade">
+        <View style={s.modalOverlay}>
+          <View style={[s.dialogBox, { backgroundColor: theme.card }]}>
+            <Text style={[s.dialogTitle, { color: theme.text }]}>Gộp 2 file PDF</Text>
+            {pdfFiles.length < 2 ? (
+              <Text style={{ color: theme.textSub, marginVertical: 16 }}>
+                Cần có ít nhất 2 file PDF trong thư mục để gộp. Vui lòng quét hoặc nhập thêm file.
+              </Text>
+            ) : (
+              <View style={{ marginVertical: 12, width: '100%' }}>
+                <Text style={{ color: theme.textSub, marginBottom: 4 }}>File thứ 1:</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 12 }}>
+                  {pdfFiles.map(f => (
+                    <TouchableOpacity
+                      key={f}
+                      onPress={() => setFile1(f)}
+                      style={[s.chip, { backgroundColor: file1 === f ? theme.accent : theme.surface }]}
+                    >
+                      <Text style={{ color: file1 === f ? '#fff' : theme.text, fontSize: 12 }}>{f}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </ScrollView>
 
-                  <Text style={[styles.selectLabel, { color: theme.text }]}>Chọn tài liệu 2:</Text>
-                  <ScrollView style={[styles.selectBox, { borderColor: theme.border, backgroundColor: theme.surface }]}>
-                    {pdfFiles.map((file, idx) => (
-                      <TouchableOpacity key={idx} style={[styles.selectItem, { borderBottomColor: theme.border }, file2 === file && [styles.selectedItem, { backgroundColor: theme.accent + '22' }]]} onPress={() => setFile2(file)}>
-                        <Text style={[styles.selectText, { color: file2 === file ? theme.accent : theme.text }]}>{file}</Text>
-                      </TouchableOpacity>
-                    ))}
-                  </ScrollView>
+                <Text style={{ color: theme.textSub, marginBottom: 4 }}>File thứ 2:</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 12 }}>
+                  {pdfFiles.map(f => (
+                    <TouchableOpacity
+                      key={f}
+                      onPress={() => setFile2(f)}
+                      style={[s.chip, { backgroundColor: file2 === f ? theme.accent : theme.surface }]}
+                    >
+                      <Text style={{ color: file2 === f ? '#fff' : theme.text, fontSize: 12 }}>{f}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </ScrollView>
 
-                  <Text style={[styles.selectLabel, { color: theme.text }]}>Tên file PDF gộp mới:</Text>
-                  <TextInput 
-                    style={[styles.modalInput, { borderColor: theme.border, backgroundColor: theme.surface, color: theme.text }]}
-                    value={mergedName}
-                    onChangeText={setMergedName}
-                    placeholder="Nhập tên file"
-                    placeholderTextColor={theme.textMuted}
-                  />
-                </View>
-              )}
-            </View>
-            <View style={styles.modalActions}>
-              <TouchableOpacity style={[styles.modalBtn, { backgroundColor: theme.surface }]} onPress={() => setMergeModalVisible(false)}>
-                <Text style={[styles.btnCancelText, { color: theme.textSub }]}>Đóng</Text>
+                <TextInput
+                  style={[s.dialogInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
+                  placeholder="Tên file sau khi gộp"
+                  placeholderTextColor={theme.textMuted}
+                  value={mergedName}
+                  onChangeText={setMergedName}
+                />
+              </View>
+            )}
+            <View style={s.dialogActions}>
+              <TouchableOpacity style={s.dialogBtn} onPress={() => setMergeModalVisible(false)}>
+                <Text style={{ color: theme.textSub }}>Hủy</Text>
               </TouchableOpacity>
               {pdfFiles.length >= 2 && (
-                <TouchableOpacity style={[styles.modalBtn, { backgroundColor: theme.warn }]} onPress={handleMergePdf}>
-                  <Text style={styles.btnConfirmText}>📎 Gộp ngay</Text>
+                <TouchableOpacity style={[s.dialogBtn, { backgroundColor: theme.accent }]} onPress={handleMergePdfs}>
+                  <Text style={{ color: '#fff', fontWeight: 'bold' }}>Bắt đầu gộp</Text>
                 </TouchableOpacity>
               )}
             </View>
@@ -797,52 +706,36 @@ export default function ToolsScreen({ route }: any) {
   );
 }
 
-const styles = StyleSheet.create({
+const s = StyleSheet.create({
   container: { flex: 1 },
-  header: { 
-    paddingTop: 56, paddingBottom: 20, paddingHorizontal: 20, 
-    borderBottomWidth: 1,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.1, shadowRadius: 6, elevation: 8,
-    marginBottom: 5, zIndex: 10
+  header: { paddingTop: 60, paddingBottom: 20, paddingHorizontal: 20, borderBottomWidth: 1 },
+  headerTitle: { fontSize: 24, fontWeight: '900', letterSpacing: 0.3 },
+  headerSub: { fontSize: 13, marginTop: 4 },
+  listContainer: { padding: 16, paddingBottom: 40 },
+  toolCard: {
+    flexDirection: 'row', alignItems: 'center', padding: 16, borderRadius: 16,
+    marginBottom: 12, borderWidth: 1, elevation: 1,
+    shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.05, shadowRadius: 3,
   },
-  headerTitle: { fontSize: 26, fontWeight: '800', letterSpacing: 0.3 },
-  content: { padding: 16, paddingBottom: 30 },
-  sectionTitle: { fontSize: 15, fontWeight: '800', marginBottom: 10, marginTop: 10, letterSpacing: 0.2 },
-  grid: { 
-    flexDirection: 'row', flexWrap: 'wrap', 
-    borderRadius: 18, padding: 14, marginBottom: 14,
-    borderWidth: 1,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.05, shadowRadius: 8, elevation: 3
-  },
-  item: { width: '33%', alignItems: 'center', marginBottom: 14, padding: 4 },
-  itemIcon: { width: 52, height: 52, borderRadius: 15, justifyContent: 'center', alignItems: 'center', marginBottom: 7 },
-  itemText: { fontSize: 11.5, marginTop: 0, textAlign: 'center', fontWeight: '600' },
-  
-  loadingOverlay: { ...StyleSheet.absoluteFill, backgroundColor: 'rgba(0,0,0,0.75)', justifyContent: 'center', alignItems: 'center', zIndex: 1000 },
-  loadingText: { color: '#fff', marginTop: 15, fontSize: 16, fontWeight: '600' },
-  
-  // Modal styles — màu sẽ được override bằng inline style theo theme
-  modalBg: { flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'center', alignItems: 'center' },
-  modalContent: { width: '90%', borderRadius: 24, padding: 24, maxHeight: '85%' },
-  modalTitle: { fontSize: 20, fontWeight: '800', marginBottom: 16, textAlign: 'center' },
-  modalBody: { marginBottom: 20 },
-  modalBodyMerge: { marginBottom: 20 },
-  modalText: { fontSize: 15, lineHeight: 24 },
-  modalActions: { flexDirection: 'row', justifyContent: 'space-between' },
-  modalBtn: { padding: 16, borderRadius: 12, width: '48%', alignItems: 'center' },
-  btnCancelText: { fontWeight: '700', fontSize: 16 },
-  btnConfirmText: { color: '#fff', fontWeight: '700', fontSize: 16 },
-
-  nameDialogContent: { width: '85%', borderRadius: 24, padding: 24 },
-  nameDialogInput: { borderWidth: 1, borderRadius: 12, padding: 14, fontSize: 16, marginVertical: 16 },
-  nameDialogActions: { flexDirection: 'row', justifyContent: 'space-between' },
-  nameDialogBtn: { padding: 16, borderRadius: 12, width: '47%', alignItems: 'center' },
-
-  selectLabel: { fontSize: 14, marginTop: 10, marginBottom: 5, fontWeight: '700' },
-  selectBox: { maxHeight: 120, borderWidth: 1, borderRadius: 12, padding: 5, marginBottom: 12 },
-  selectItem: { padding: 12, borderBottomWidth: 1 },
-  selectedItem: { borderRadius: 8 },
-  selectText: { fontSize: 14, fontWeight: '500' },
-  modalInput: { borderWidth: 1, borderRadius: 12, padding: 14, fontSize: 15, marginTop: 5 },
-  emptyText: { fontSize: 14, textAlign: 'center', padding: 20, lineHeight: 22, fontStyle: 'italic' }
+  iconBox: { width: 52, height: 52, borderRadius: 14, justifyContent: 'center', alignItems: 'center', marginRight: 16 },
+  toolInfo: { flex: 1 },
+  toolTitle: { fontSize: 16, fontWeight: '700', marginBottom: 3 },
+  toolDesc: { fontSize: 12.5, lineHeight: 17 },
+  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'center', alignItems: 'center', padding: 20 },
+  loadingBox: { padding: 28, borderRadius: 20, alignItems: 'center', elevation: 8 },
+  loadingText: { marginTop: 16, fontSize: 15, fontWeight: '600' },
+  dialogBox: { width: width * 0.88, borderRadius: 20, padding: 22, alignItems: 'center', elevation: 10 },
+  dialogTitle: { fontSize: 18, fontWeight: 'bold', marginBottom: 14, textAlign: 'center' },
+  dialogInput: { width: '100%', height: 46, borderRadius: 10, borderWidth: 1, paddingHorizontal: 14, fontSize: 15, marginBottom: 16 },
+  dialogActions: { flexDirection: 'row', justifyContent: 'flex-end', width: '100%', gap: 12 },
+  dialogBtn: { paddingVertical: 10, paddingHorizontal: 18, borderRadius: 10 },
+  chip: { paddingVertical: 6, paddingHorizontal: 12, borderRadius: 8, marginRight: 8, borderWidth: 1, borderColor: 'transparent' },
+  resultBox: { width: width * 0.92, maxHeight: '80%', borderRadius: 24, padding: 20, elevation: 12 },
+  resultHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
+  resultTitle: { fontSize: 18, fontWeight: 'bold' },
+  resultScroll: { maxHeight: 380, marginBottom: 16 },
+  sectionHeader: { fontSize: 13, fontWeight: '700', marginBottom: 6 },
+  resultContent: { fontSize: 15, lineHeight: 22 },
+  actionBtn: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', height: 48, borderRadius: 12 },
+  actionBtnText: { color: '#fff', fontSize: 15, fontWeight: 'bold' },
 });

@@ -16,7 +16,7 @@ import DocumentScanner from 'react-native-document-scanner-plugin';
 import { FilterMode, getCanvasProcessingScript, getCssFilterForMode } from '../utils/imageProcessor';
 import { savePdfToDocuments } from '../utils/fileHelper';
 import Storage from '../utils/storage';
-import { SCAN_QUALITY_KEY, COLOR_MODE_KEY, SAVE_ORIGINAL_KEY } from './MeScreen';
+import { STORAGE_KEYS } from '../constants/config';
 import CropView, { Point } from '../components/CropView';
 
 const { width, height } = Dimensions.get('window');
@@ -72,9 +72,9 @@ export default function ScannerScreen({ route, navigation }: any) {
     // Tải cấu hình từ Cài đặt
     const initSettings = async () => {
       try {
-        const q = await Storage.getItem(SCAN_QUALITY_KEY);
-        const c = await Storage.getItem(COLOR_MODE_KEY);
-        const s = await Storage.getItem(SAVE_ORIGINAL_KEY);
+        const q = await Storage.getItem(STORAGE_KEYS.SCAN_QUALITY);
+        const c = await Storage.getItem(STORAGE_KEYS.COLOR_MODE);
+        const s = await Storage.getItem(STORAGE_KEYS.SAVE_ORIGINAL);
         if (q === 'high' || q === 'medium' || q === 'low') setScanQuality(q);
         if (c === 'grayscale') setFilterMode('grayscale');
         else if (c === 'bw') setFilterMode('bw');
@@ -106,7 +106,14 @@ export default function ScannerScreen({ route, navigation }: any) {
   };
 
   useEffect(() => {
-    // Kiểm tra draft session trước khi bắt đầu quét mới
+    // 1. Nếu có ảnh truyền sang từ route.params (ví dụ từ FilesScreen hoặc ToolsScreen)
+    if (route.params?.importImages && Array.isArray(route.params.importImages) && route.params.importImages.length > 0) {
+      setImages(route.params.importImages);
+      setSessionChecked(true);
+      return;
+    }
+
+    // 2. Kiểm tra draft session trước khi bắt đầu quét mới
     const checkDraftAndInit = async () => {
       try {
         const rawDraft = await Storage.getItem(DRAFT_SCAN_SESSION_KEY);
@@ -151,7 +158,7 @@ export default function ScannerScreen({ route, navigation }: any) {
     };
 
     checkDraftAndInit();
-  }, []);
+  }, [route.params?.importImages]);
 
   const pickImage = async () => {
     const result = await ImagePicker.launchImageLibraryAsync({
@@ -189,7 +196,7 @@ export default function ScannerScreen({ route, navigation }: any) {
   };
 
   const createPdf = async () => {
-    const trimPercent = trimMargin ? 4 : 0; // Tăng lên 4% để loại bỏ triệt để viền lẹm
+    const trimPercent = trimMargin ? 2.0 : 0; // Tỉa nhẹ 2% nếu người dùng bật
     const canvasScript = getCanvasProcessingScript();
     const cssFilter = getCssFilterForMode(filterMode);
 
@@ -197,34 +204,41 @@ export default function ScannerScreen({ route, navigation }: any) {
     let targetWidth = 1200;
     let targetCompress = 0.75;
     if (scanQuality === 'high') {
-      targetWidth = 1600;
-      targetCompress = 0.90;
+      targetWidth = 1500;
+      targetCompress = 0.85;
     } else if (scanQuality === 'low') {
-      targetWidth = 900;
-      targetCompress = 0.60;
+      targetWidth = 850;
+      targetCompress = 0.55;
     }
 
-    // Xử lý tuần tự tránh dồn ép RAM cùng lúc (OOM protection)
+    // Xử lý nén ảnh theo batch nhỏ và dùng trực tiếp file URI (không nhồi Base64 vào JS RAM)
     const imgTagsArray: string[] = [];
-    for (let index = 0; index < images.length; index++) {
-      const imgUri = images[index];
-      let base64Uri = imgUri;
-      if (!imgUri.startsWith('data:')) {
-        try {
-          const manipResult = await ImageManipulator.manipulateAsync(
-            imgUri,
-            [{ resize: { width: targetWidth } }],
-            { compress: targetCompress, format: ImageManipulator.SaveFormat.JPEG, base64: true }
-          );
-          base64Uri = `data:image/jpeg;base64,${manipResult.base64}`;
-        } catch (e) {
-          console.warn('Image process error:', e);
-          base64Uri = imgUri;
-        }
-      }
-      imgTagsArray.push(`<div class="page">
-        <img id="scanImg_${index}" src="${base64Uri}" style="${filterMode !== 'magic' ? `filter: ${cssFilter};` : ''}" crossorigin="anonymous" />
-      </div>`);
+    const BATCH_SIZE = 2;
+    for (let i = 0; i < images.length; i += BATCH_SIZE) {
+      const batch = images.slice(i, i + BATCH_SIZE);
+      const processedBatch = await Promise.all(
+        batch.map(async (imgUri, batchIdx) => {
+          const actualIndex = i + batchIdx;
+          let fileUri = imgUri;
+          if (!imgUri.startsWith('data:')) {
+            try {
+              const manipResult = await ImageManipulator.manipulateAsync(
+                imgUri,
+                [{ resize: { width: targetWidth } }],
+                { compress: targetCompress, format: ImageManipulator.SaveFormat.JPEG, base64: false }
+              );
+              fileUri = manipResult.uri;
+            } catch (e) {
+              console.warn('[Scanner] Image process error:', e);
+              fileUri = imgUri;
+            }
+          }
+          return `<div class="page">
+            <img id="scanImg_${actualIndex}" src="${fileUri}" style="${filterMode !== 'magic' ? `filter: ${cssFilter};` : ''}" crossorigin="anonymous" />
+          </div>`;
+        })
+      );
+      imgTagsArray.push(...processedBatch);
     }
     const imgTags = imgTagsArray.join('');
 
@@ -267,7 +281,12 @@ export default function ScannerScreen({ route, navigation }: any) {
                 const img = document.getElementById('scanImg_' + i);
                 if (img) {
                   try {
-                    const opts = { trimMarginPercent: trimP, contrast: 1.45 };
+                    const opts = {
+                      trimMarginPercent: trimP,
+                      contrast: 1.4,
+                      enablePerspectiveWarp: true,
+                      bookMode: false // Scan thông thường: không chạy dewarp bẻ cong ảnh
+                    };
                     if (customMap[i]) {
                       opts.customCornersRatio = customMap[i];
                     }
@@ -278,7 +297,6 @@ export default function ScannerScreen({ route, navigation }: any) {
                   }
                 }
               }
-              setTimeout(() => window.ReactNativeWebView?.postMessage('done'), 1000);
             };
           </script>
         </body>
