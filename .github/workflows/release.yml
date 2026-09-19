@@ -26,7 +26,15 @@ jobs:
           cache: 'npm'
 
       - name: Install Dependencies
-        run: npm install
+        run: npm ci || npm install
+
+      - name: Verify Code Quality & Type Integrity
+        run: |
+          npm run typecheck
+          npm test
+
+      - name: Run Expo Doctor Health Check
+        run: npx expo-doctor || true
 
       - name: Extract App Version
         id: get_version
@@ -51,6 +59,14 @@ jobs:
         run: |
           cd android
           ./gradlew clean assembleRelease
+
+      - name: Verify APK File Integrity
+        run: |
+          if [ ! -f android/app/build/outputs/apk/release/app-release.apk ]; then
+            echo "❌ CRITICAL: app-release.apk was not generated!"
+            exit 1
+          fi
+          echo "✅ APK generated successfully: $(ls -lh android/app/build/outputs/apk/release/app-release.apk)"
 
       - name: Create or Update GitHub Release and Upload APK
         uses: softprops/action-gh-release@v2
