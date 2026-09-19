@@ -11,10 +11,26 @@ import * as Sharing from 'expo-sharing';
 import * as FileSystem from 'expo-file-system';
 import * as ImageManipulator from 'expo-image-manipulator';
 import { Ionicons } from '@expo/vector-icons';
-import DocumentScanner from 'react-native-document-scanner-plugin';
+
+// Safe Dynamic Loader for DocumentScanner to prevent fatal startup crash
+let cachedDocumentScanner: any = null;
+let scannerChecked = false;
+
+function getDocumentScanner(): any {
+  if (scannerChecked) return cachedDocumentScanner;
+  try {
+    const mod = require('react-native-document-scanner-plugin');
+    cachedDocumentScanner = mod.default || mod;
+  } catch (err) {
+    console.warn('[Scanner] Native DocumentScanner plugin is not available:', err);
+    cachedDocumentScanner = null;
+  }
+  scannerChecked = true;
+  return cachedDocumentScanner;
+}
 
 import { FilterMode, getCanvasProcessingScript, getCssFilterForMode } from '../utils/imageProcessor';
-import { savePdfToDocuments } from '../utils/fileHelper';
+import { savePdfToDocuments, getDocumentDirectory } from '../utils/fileHelper';
 import Storage from '../utils/storage';
 import { STORAGE_KEYS } from '../constants/config';
 import CropView, { Point } from '../components/CropView';
@@ -87,9 +103,61 @@ export default function ScannerScreen({ route, navigation }: any) {
     initSettings();
   }, []);
 
+  const pickImage = async () => {
+    try {
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ['images'],
+        allowsMultipleSelection: true,
+        quality: 1,
+      });
+      if (!result.canceled && result.assets && result.assets.length > 0) {
+        const uris = result.assets.map(a => a.uri);
+        setImages(prev => [...prev, ...uris]);
+      }
+    } catch (err) {
+      console.warn('[Scanner] Pick image error:', err);
+    }
+  };
+
+  const takePhotoFallback = async () => {
+    try {
+      const perm = await ImagePicker.requestCameraPermissionsAsync();
+      if (!perm.granted) {
+        Alert.alert('Quyền truy cập Camera', 'Ứng dụng cần quyền sử dụng máy ảnh để chụp tài liệu.');
+        if (images.length === 0) navigation.goBack();
+        return;
+      }
+      const result = await ImagePicker.launchCameraAsync({
+        quality: scanQuality === 'high' ? 1 : scanQuality === 'medium' ? 0.85 : 0.7,
+      });
+      if (!result.canceled && result.assets && result.assets.length > 0) {
+        setImages(prev => [...prev, result.assets[0].uri]);
+      } else if (images.length === 0) {
+        navigation.goBack();
+      }
+    } catch (err) {
+      console.warn('[Scanner] Camera fallback error:', err);
+      if (images.length === 0) navigation.goBack();
+    }
+  };
+
   const startScan = async () => {
     try {
-      const { scannedImages, status } = await DocumentScanner.scanDocument({
+      const scanner = getDocumentScanner();
+      if (!scanner || typeof scanner.scanDocument !== 'function') {
+        Alert.alert(
+          'Máy quét tài liệu',
+          'Trình quét phần cứng (Google ML Kit) chưa sẵn sàng hoặc không hỗ trợ trên thiết bị này. Bạn có muốn chụp ảnh bằng camera hoặc chọn ảnh từ thư viện?',
+          [
+            { text: 'Hủy', style: 'cancel', onPress: () => { if (images.length === 0) navigation.goBack(); } },
+            { text: 'Chụp ảnh', onPress: takePhotoFallback },
+            { text: 'Chọn ảnh', onPress: pickImage },
+          ]
+        );
+        return;
+      }
+
+      const { scannedImages, status } = await scanner.scanDocument({
         maxNumDocuments: 20,
       });
 
@@ -98,10 +166,17 @@ export default function ScannerScreen({ route, navigation }: any) {
       } else if (images.length === 0) {
         navigation.goBack();
       }
-    } catch (e) {
-      console.error(e);
-      Alert.alert('Lỗi', 'Không thể khởi động máy quét tài liệu.');
-      if (images.length === 0) navigation.goBack();
+    } catch (e: any) {
+      console.error('[Scanner] DocumentScanner error:', e);
+      Alert.alert(
+        'Lỗi máy quét',
+        'Không thể khởi động máy quét tự động. Bạn có muốn dùng máy ảnh thông thường?',
+        [
+          { text: 'Hủy', style: 'cancel', onPress: () => { if (images.length === 0) navigation.goBack(); } },
+          { text: 'Chụp camera', onPress: takePhotoFallback },
+          { text: 'Chọn ảnh', onPress: pickImage },
+        ]
+      );
     }
   };
 
@@ -160,17 +235,6 @@ export default function ScannerScreen({ route, navigation }: any) {
     checkDraftAndInit();
   }, [route.params?.importImages]);
 
-  const pickImage = async () => {
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ['images'],
-      allowsMultipleSelection: true,
-      quality: 1,
-    });
-    if (!result.canceled && result.assets) {
-      const uris = result.assets.map(a => a.uri);
-      setImages(prev => [...prev, ...uris]);
-    }
-  };
 
   const handleDeleteImage = async (index: number) => {
     const remaining = images.filter((_, i) => i !== index);
@@ -324,8 +388,27 @@ export default function ScannerScreen({ route, navigation }: any) {
       const uri = await createPdf();
       await savePdfToDocuments(uri, fileName);
 
-      // Nếu người dùng chọn KHÔNG giữ ảnh gốc, dọn dẹp các file cache ảnh scan tạm
-      if (!saveOriginal) {
+      // Xử lý setting 'Giữ ảnh gốc' (saveOriginal)
+      if (saveOriginal) {
+        try {
+          const docRoot = getDocumentDirectory();
+          const imgFolder = `${docRoot}${fileName}_images/`;
+          const folderInfo = await FileSystem.getInfoAsync(imgFolder);
+          if (!folderInfo.exists) {
+            await FileSystem.makeDirectoryAsync(imgFolder, { intermediates: true });
+          }
+          for (let i = 0; i < images.length; i++) {
+            const src = images[i];
+            const dest = `${imgFolder}trang_${i + 1}.jpg`;
+            if (src.startsWith('file://')) {
+              await FileSystem.copyAsync({ from: src, to: dest });
+            }
+          }
+        } catch (imgErr) {
+          console.warn('[Scanner] Could not copy original images:', imgErr);
+        }
+      } else {
+        // Dọn dẹp các file cache ảnh scan tạm nếu người dùng tắt lưu ảnh gốc
         for (const imgUri of images) {
           try {
             if (imgUri.startsWith('file://')) {

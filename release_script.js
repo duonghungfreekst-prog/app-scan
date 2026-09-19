@@ -51,7 +51,10 @@ const nextVersionCode = explicitVersionCode || (oldVersionCode + 1);
 appJson.expo.android.versionCode = nextVersionCode;
 fs.writeFileSync(appJsonPath, JSON.stringify(appJson, null, 2) + '\n');
 
-console.log(` -> Đã ghi nhận: version=${newVersion}, versionCode=${nextVersionCode} (trước đó: ${oldVersionCode}).`);
+// 3. Tự động đồng bộ package-lock.json
+try {
+  execSync('npm install --package-lock-only', { stdio: 'ignore' });
+} catch (e) {}
 
 console.log(`\n🚀 BƯỚC 3/3: Đóng gói Git Commit, Tạo Tag và Đẩy lên GitHub...`);
 try {

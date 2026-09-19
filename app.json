@@ -45,7 +45,8 @@
         "expo-document-picker",
         {}
       ],
-      "expo-web-browser"
+      "expo-web-browser",
+      "react-native-document-scanner-plugin"
     ]
   }
 }

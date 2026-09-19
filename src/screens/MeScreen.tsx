@@ -101,7 +101,7 @@ export default function MeScreen({ navigation }: any) {
     { key: 'bw',        label: '⬛ Trắng đen' },
   ];
 
-  const appVersion = Constants.expoConfig?.version || '2.5.0';
+  const appVersion = Constants.expoConfig?.version || '2.6.0';
 
   return (
     <ScrollView style={[s.container, { backgroundColor: theme.bg }]} contentContainerStyle={{ paddingBottom: 50 }} showsVerticalScrollIndicator={false}>

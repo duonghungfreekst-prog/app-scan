@@ -54,6 +54,11 @@ appJson.expo.android.versionCode = newCode;
 fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
 fs.writeFileSync(appJsonPath, JSON.stringify(appJson, null, 2) + '\n');
 
+// Tự động đồng bộ package-lock.json
+try {
+  execSync('npm install --package-lock-only', { stdio: 'ignore' });
+} catch (e) {}
+
 console.log(` -> Phiên bản nâng cấp: v${currentVer} -> v${newVersion}`);
 console.log(` -> Android Build Code: ${oldCode} -> ${newCode}`);
 
