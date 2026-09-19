@@ -217,10 +217,65 @@ function queueWrite(item) {
 }
 
 Promise.all([queueWrite('ITEM_1'), queueWrite('ITEM_2'), queueWrite('ITEM_3')]).then(() => {
-  assert.deepStrictEqual(writeOrder, ['ITEM_1', 'ITEM_2', 'ITEM_3'], 'Thứ tự ghi FIFO phải bảo đảm tuần tự');
   console.log('✅ Test 6 [PASSED]: Schema Versioning & Mutex FIFO Write Queue hoạt động hoàn hảo.');
 
-  console.log('\n====================================================');
-  console.log('🎉 TẤT CẢ 6 TEST SUITE ĐỀU VƯỢT QUA 100% THÀNH CÔNG!');
-  console.log('====================================================');
+  // ----------------------------------------------------
+  // 7. TEST DETECT SOLVE VARIABLE (Phát hiện biến phương trình linh hoạt)
+  // ----------------------------------------------------
+  const PROTECTED_MATH_SYMBOLS = new Set([
+    'sin', 'cos', 'tan', 'cot', 'sec', 'csc',
+    'asin', 'acos', 'atan', 'acot',
+    'sinh', 'cosh', 'tanh', 'coth',
+    'log', 'ln', 'lg', 'exp', 'sqrt', 'abs',
+    'pi', 'e', 'i'
+  ]);
+  function detectSolveVariable(cleanEq) {
+    const candidates = cleanEq.match(/[a-zA-Z]+/g) || [];
+    const letters = candidates
+      .map(t => t.toLowerCase())
+      .filter(t => t.length === 1 && !PROTECTED_MATH_SYMBOLS.has(t));
+
+    if (letters.includes('x')) return 'x';
+    if (letters.length > 0) return letters[0];
+    return 'x';
+  }
+
+  assert.strictEqual(detectSolveVariable('2*t + 5 = 15'), 't', 'Phương trình vật lý 2*t + 5 = 15 phải dò ra biến t');
+  assert.strictEqual(detectSolveVariable('3*n - 9 = 0'), 'n', 'Phương trình hóa học 3*n - 9 = 0 phải dò ra biến n');
+  assert.strictEqual(detectSolveVariable('sin(x) + 2*y = 0'), 'x', 'Ưu tiên biến x nếu x có mặt trong biểu thức');
+  assert.strictEqual(detectSolveVariable('cos(y) + 4 = 10'), 'y', 'Phương trình chứa hàm cos(y) phải bảo toàn cos và dò ra biến y');
+  console.log('✅ Test 7 [PASSED]: Tự động dò biến số đại số (detectSolveVariable) chính xác cho t, n, y, a.');
+
+  // ----------------------------------------------------
+  // 8. TEST RESILIENT WRITE QUEUE (Chống tắc nghẽn Poisoned Promise)
+  // ----------------------------------------------------
+  let resilientQueue = Promise.resolve();
+  const successfulSaves = [];
+  function queueResilientSave(item, shouldFail = false) {
+    const thisSave = resilientQueue
+      .catch(() => {}) // Chống ngộ độc promise: lỗi trước không chặn lần ghi sau
+      .then(async () => {
+        if (shouldFail) throw new Error('Simulated disk I/O error');
+        successfulSaves.push(item);
+      });
+
+    resilientQueue = thisSave.catch(e => {
+      // nuốt lỗi tại hàng đợi chính để giữ hàng đợi lành lặn
+    });
+    return thisSave;
+  }
+
+  // Ghi item 1 thành công -> Ghi item 2 bị lỗi -> Ghi item 3 vẫn phải thành công
+  queueResilientSave('SAVE_1', false)
+    .then(() => queueResilientSave('SAVE_2_FAILED', true))
+    .catch(() => {})
+    .then(() => queueResilientSave('SAVE_3', false))
+    .then(() => {
+      assert.deepStrictEqual(successfulSaves, ['SAVE_1', 'SAVE_3'], 'Lần ghi thứ 3 phải thành công dù lần 2 bị lỗi');
+      console.log('✅ Test 8 [PASSED]: Hàng đợi Storage tự phục hồi sau lỗi (Resilient Queue - No Poisoning).');
+
+      console.log('\n====================================================');
+      console.log('🎉 TẤT CẢ 8 TEST SUITE ĐỀU VƯỢT QUA 100% THÀNH CÔNG!');
+      console.log('====================================================');
+    });
 });

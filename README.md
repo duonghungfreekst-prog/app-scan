@@ -6,10 +6,10 @@
 
 ## 🌟 Tính năng Nổi bật
 
-- 📄 **Quét tài liệu thông minh (Smart Scanner):** Tự động phát hiện góc giấy, nắn thẳng phối cảnh (Perspective Warp), hỗ trợ quét tới 20 trang liên tục.
+- 📄 **Quét tài liệu thông minh (Smart Scanner):** Tự động phát hiện góc giấy và nắn thẳng phối cảnh (Perspective Warp) qua Google ML Kit native module trên bản build Android APK, hỗ trợ nắn chỉnh 4 góc thủ công (CropView) và quét tới 20 trang liên tục.
 - 🎨 **Bộ lọc hình ảnh chuyên sâu:** 
-  - `Magic Paper`: Tự động làm trắng nền giấy, tăng độ sắc nét chữ, giữ nguyên màu mộc đỏ và mực chữ ký.
-  - `Grayscale` & `Black & White`: Tối ưu dung lượng cho tài liệu văn phòng.
+  - `Magic Paper`: Tự động làm trắng nền giấy, tăng độ sắc nét chữ bằng Unsharp Mask (high-pass filter), giữ nguyên màu mộc đỏ và mực chữ ký.
+  - `Grayscale` & `Black & White`: Nhị phân hóa thích ứng theo lưới nền cục bộ (Adaptive Local Threshold) tối ưu dung lượng cho tài liệu văn phòng.
 - 📐 **Căn chỉnh viền thủ công (CropView):** Kéo thả 4 góc tự do để tùy biến vùng quét chính xác.
 - 📑 **Xuất PDF & Văn phòng:** Tạo tài liệu PDF tiêu chuẩn, chuyển đổi sang Word (`.docx`) và Excel (`.xlsx`).
 - 🤖 **Trí tuệ nhân tạo (Gemini AI Vision):**
@@ -17,7 +17,7 @@
   - Giải toán thông minh: Kết hợp giải nhanh bằng On-device CAS (`Nerdamer`) và phân tích bài toán hình học/sơ đồ bằng Gemini Vision.
   - Dịch thuật tài liệu đa ngôn ngữ.
 - 🏁 **Công cụ Mã QR & Barcode:**
-  - Quét mã siêu tốc từ Camera hoặc thư viện ảnh, chặn link độc hại.
+  - Quét mã siêu tốc từ Camera hoặc thư viện ảnh, tự động nhận diện và chặn các URL scheme nguy hiểm (javascript:, data:, file:...).
   - Tạo mã QR đa dạng mẫu (Wi-Fi, Website, Điện thoại, Email, Danh thiếp).
 - 📁 **Quản lý Tài liệu Chuyên nghiệp:** Tạo thư mục phân cấp, điều hướng Breadcrumb, tìm kiếm theo thời gian thực và tự động đánh số chống ghi đè file.
 - 🌙 **Giao diện Đẳng cấp:** Hỗ trợ Dark Mode và Light Mode mượt mà.
@@ -103,4 +103,4 @@ npm run release 2.5.1
 
 ## 📄 Bản quyền & Giấy phép
 Phát hành theo giấy phép [MIT License](LICENSE).
-Tất cả các thuật toán xử lý ảnh Sobel, Dewarp và Magic Paper filter được phát triển độc lập.
+Phát triển trên nền tảng React Native / Expo với các thuật toán xử lý ảnh Unsharp Mask, Dewarp gáy sách, bộ lọc Magic Paper thích ứng và phép biến đổi Homography nắn phối cảnh được tối ưu độc lập.

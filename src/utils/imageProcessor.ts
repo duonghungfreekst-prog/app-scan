@@ -213,6 +213,41 @@ export const getCanvasProcessingScript = (): string => {
     }
 
     /* =====================================================================
+       2b. UNSHARP MASK — làm nét chữ thật sự thay vì chỉ đẩy độ tương phản
+       ===================================================================== */
+    function applyUnsharpMask(data, W, H, amount) {
+      // Box-blur 3x3 trên kênh luminance rồi cộng lại phần chênh lệch (high-pass)
+      // vào ảnh gốc. Rẻ hơn Gaussian nhưng đủ để làm nét chữ scan mà không sinh
+      // halo quá mức ở tài liệu văn bản thông thường.
+      const len = W * H;
+      const lum = new Float32Array(len);
+      for (let i = 0; i < len; i++) {
+        const o = i * 4;
+        lum[i] = 0.299 * data[o] + 0.587 * data[o + 1] + 0.114 * data[o + 2];
+      }
+      const blurred = new Float32Array(len);
+      for (let y = 0; y < H; y++) {
+        const y0 = Math.max(0, y - 1), y1 = Math.min(H - 1, y + 1);
+        for (let x = 0; x < W; x++) {
+          const x0 = Math.max(0, x - 1), x1 = Math.min(W - 1, x + 1);
+          let sum = 0;
+          sum += lum[y0 * W + x0] + lum[y0 * W + x] + lum[y0 * W + x1];
+          sum += lum[y * W + x0]  + lum[y * W + x]  + lum[y * W + x1];
+          sum += lum[y1 * W + x0] + lum[y1 * W + x] + lum[y1 * W + x1];
+          blurred[y * W + x] = sum / 9;
+        }
+      }
+      for (let i = 0; i < len; i++) {
+        const highPass = lum[i] - blurred[i];
+        const gain = 1 + amount * (highPass / 255);
+        const o = i * 4;
+        for (let c = 0; c < 3; c++) {
+          data[o + c] = Math.max(0, Math.min(255, Math.round(data[o + c] * gain + highPass * amount)));
+        }
+      }
+    }
+
+    /* =====================================================================
        3. MAGIC PAPER & ADAPTIVE BINARIZATION ENHANCEMENT
        ===================================================================== */
     function applyMagicEnhancement(canvas, filterMode, contrastFactor) {
@@ -221,6 +256,19 @@ export const getCanvasProcessingScript = (): string => {
       const ctx = canvas.getContext('2d');
       const imgData = ctx.getImageData(0, 0, W, H);
       const data = imgData.data;
+
+      // FIX: contrastFactor was previously accepted but never used anywhere in this
+      // function, so the "Scan quality" contrast setting had zero visible effect on
+      // the output. Clamp it to a sane range and derive a gamma exponent + B&W
+      // threshold multiplier from it so the slider/quality setting is now real.
+      const cf = Math.max(0.6, Math.min(2.2, Number(contrastFactor) || 1.45));
+      const gammaPower = 2.6 * (cf / 1.45);        // higher contrast -> steeper curve
+      const bwThresholdMul = 0.76 * (1 / (cf / 1.45)); // higher contrast -> stricter B&W cut
+
+      // FIX: apply a lightweight unsharp-mask so scanned text edges look genuinely
+      // crisper instead of only being pushed through a brightness curve. This runs on
+      // luminance only (cheap 3x3 box blur) before the color/binarization pass below.
+      applyUnsharpMask(data, W, H, 0.55);
 
       // Ước lượng nền chiếu sáng (Illumination background estimation)
       const bgW = Math.max(16, Math.floor(W / 32));
@@ -307,14 +355,14 @@ export const getCanvasProcessingScript = (): string => {
                 r = g = b = 255;
               } else {
                 let factor = Math.max(0, normLum / 195);
-                factor = Math.pow(factor, 2.6); // Mềm hơn 3.5 để bảo vệ nét mảnh
+                factor = Math.pow(factor, gammaPower); // giờ phản ứng theo contrastFactor thật
                 const finalVal = Math.round(factor * 215);
                 r = g = b = finalVal;
               }
             }
           } else if (filterMode === 'bw') {
             // Adaptive local threshold thay vì so sánh tuyệt đối với 185
-            const localThreshold = bgLum * 0.76;
+            const localThreshold = bgLum * bwThresholdMul;
             r = g = b = (lum > localThreshold && !isRedStamp && !isBlueInk) ? 255 : 0;
           } else if (filterMode === 'grayscale') {
             let gray = normLum;

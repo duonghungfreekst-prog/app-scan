@@ -8,7 +8,7 @@ import {
 import * as Print from 'expo-print';
 import * as ImagePicker from 'expo-image-picker';
 import * as Sharing from 'expo-sharing';
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
 import * as ImageManipulator from 'expo-image-manipulator';
 import { Ionicons } from '@expo/vector-icons';
 
@@ -32,7 +32,7 @@ function getDocumentScanner(): any {
 import { FilterMode, getCanvasProcessingScript, getCssFilterForMode } from '../utils/imageProcessor';
 import { savePdfToDocuments, getDocumentDirectory } from '../utils/fileHelper';
 import Storage from '../utils/storage';
-import { STORAGE_KEYS } from '../constants/config';
+import { STORAGE_KEYS, IMAGE_PROCESSING_CONFIG } from '../constants/config';
 import CropView, { Point } from '../components/CropView';
 
 const { width, height } = Dimensions.get('window');
@@ -260,19 +260,25 @@ export default function ScannerScreen({ route, navigation }: any) {
   };
 
   const createPdf = async () => {
-    const trimPercent = trimMargin ? 2.0 : 0; // Tỉa nhẹ 2% nếu người dùng bật
+    const trimPercent = trimMargin
+      ? IMAGE_PROCESSING_CONFIG.EDGE_CLEANUP_TRIM_PERCENT
+      : IMAGE_PROCESSING_CONFIG.DEFAULT_TRIM_MARGIN_PERCENT;
     const canvasScript = getCanvasProcessingScript();
     const cssFilter = getCssFilterForMode(filterMode);
 
-    // Chọn tham số nén theo scanQuality đã cấu hình
-    let targetWidth = 1200;
-    let targetCompress = 0.75;
+    // Chọn tham số nén và độ tương phản theo scanQuality đã cấu hình tập trung
+    let targetWidth: number = IMAGE_PROCESSING_CONFIG.QUALITY.medium.width;
+    let targetCompress: number = IMAGE_PROCESSING_CONFIG.QUALITY.medium.compress;
+    let scanContrast: number = IMAGE_PROCESSING_CONFIG.DEFAULT_CONTRAST;
+
     if (scanQuality === 'high') {
-      targetWidth = 1500;
-      targetCompress = 0.85;
+      targetWidth = IMAGE_PROCESSING_CONFIG.QUALITY.high.width;
+      targetCompress = IMAGE_PROCESSING_CONFIG.QUALITY.high.compress;
+      scanContrast = 1.55;
     } else if (scanQuality === 'low') {
-      targetWidth = 850;
-      targetCompress = 0.55;
+      targetWidth = IMAGE_PROCESSING_CONFIG.QUALITY.low.width;
+      targetCompress = IMAGE_PROCESSING_CONFIG.QUALITY.low.compress;
+      scanContrast = 1.35;
     }
 
     // Xử lý nén ảnh theo batch nhỏ và dùng trực tiếp file URI (không nhồi Base64 vào JS RAM)
@@ -347,7 +353,7 @@ export default function ScannerScreen({ route, navigation }: any) {
                   try {
                     const opts = {
                       trimMarginPercent: trimP,
-                      contrast: 1.4,
+                      contrast: ${scanContrast},
                       enablePerspectiveWarp: true,
                       bookMode: false // Scan thông thường: không chạy dewarp bẻ cong ảnh
                     };
@@ -408,11 +414,15 @@ export default function ScannerScreen({ route, navigation }: any) {
           console.warn('[Scanner] Could not copy original images:', imgErr);
         }
       } else {
-        // Dọn dẹp các file cache ảnh scan tạm nếu người dùng tắt lưu ảnh gốc
+        // Dọn dẹp an toàn: chỉ xóa các file ảnh tạm do app sinh ra trong cacheDirectory,
+        // tuyệt đối không xóa nhầm ảnh gốc được chọn từ thư viện thiết bị
         for (const imgUri of images) {
           try {
             if (imgUri.startsWith('file://')) {
-              await FileSystem.deleteAsync(imgUri, { idempotent: true });
+              const isAppCache = FileSystem.cacheDirectory && imgUri.startsWith(FileSystem.cacheDirectory);
+              if (isAppCache) {
+                await FileSystem.deleteAsync(imgUri, { idempotent: true });
+              }
             }
           } catch (delErr) {
             console.warn('[Scanner] Could not clean up temp image:', delErr);

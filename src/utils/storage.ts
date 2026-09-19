@@ -141,11 +141,24 @@ function queueSave(): Promise<void> {
     data: { ...cache.data },
   };
 
-  writeQueue = writeQueue.then(() => executeAtomicSave(snapshot)).catch(e => {
+  // FIX: writeQueue used to be reassigned to the *same* rejected/resolved promise
+  // chain (`writeQueue.then(...).catch(...)`). Once any single write failed, that
+  // chain became a permanently-rejected promise, so every subsequent
+  // `writeQueue.then(nextSave)` was skipped forever (no onRejected handler) —
+  // silently dropping every write for the rest of the app session while only
+  // re-throwing the *original* stale error. We now always resume from a resolved
+  // promise so one failed write can never poison later ones, and each write's own
+  // error is reported for that write only.
+  const thisSave = writeQueue
+    .catch(() => {}) // never let a previous failure block this write from attempting
+    .then(() => executeAtomicSave(snapshot));
+
+  writeQueue = thisSave.catch(e => {
     console.error('[Storage] Queue save error:', e);
-    throw e;
+    // swallow here so the *queue* stays healthy; the error is still surfaced below
   });
-  return writeQueue;
+
+  return thisSave;
 }
 
 export const Storage = {

@@ -63,6 +63,22 @@ export class MathSolverService {
   }
 
   /**
+   * Dò biến số cần giải trong phương trình thay vì ép cứng là 'x'.
+   * Ưu tiên 'x' nếu có mặt (thói quen phổ biến), nếu không thì lấy chữ cái đơn
+   * đầu tiên xuất hiện mà không nằm trong danh sách hàm/hằng số được bảo vệ.
+   */
+  public static detectSolveVariable(cleanEq: string): string {
+    const candidates = cleanEq.match(/[a-zA-Z]+/g) || [];
+    const letters = candidates
+      .map(t => t.toLowerCase())
+      .filter(t => t.length === 1 && !PROTECTED_MATH_SYMBOLS.has(t));
+
+    if (letters.includes('x')) return 'x';
+    if (letters.length > 0) return letters[0];
+    return 'x'; // fallback an toàn nếu không dò được biến nào
+  }
+
+  /**
    * Giải phương trình hoặc tính toán biểu thức đại số bằng On-Device CAS (Nerdamer)
    */
   public static solveWithCas(rawEquation: string): MathSolution {
@@ -99,8 +115,12 @@ export class MathSolverService {
 
       let ans: any;
       if (cleanEq.includes('=')) {
-        // Phương trình đại số
-        ans = nerdamer.solveEquations(cleanEq, 'x');
+        // FIX: biến giải luôn bị ép cứng là 'x'. Nếu đề bài dùng biến khác (y, t, a, n...)
+        // — rất phổ biến với đề Vật lý/Hóa (t = thời gian, n = số mol...) — Nerdamer sẽ
+        // không tìm được nghiệm hoặc trả về nghiệm rỗng dù phương trình hợp lệ.
+        // Giờ tự dò biến số thực sự xuất hiện trong biểu thức thay vì giả định 'x'.
+        const solveVar = this.detectSolveVariable(cleanEq);
+        ans = nerdamer.solveEquations(cleanEq, solveVar);
       } else {
         // Rút gọn / Tính giá trị biểu thức
         ans = nerdamer(cleanEq).evaluate();

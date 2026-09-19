@@ -157,12 +157,23 @@ export class GeminiService {
         return text.trim();
       } catch (error: any) {
         clearTimeout(timeoutId);
-        if (error.name === 'AbortError') {
+        if (error?.name === 'AbortError') {
           throw new Error('Yêu cầu tới Gemini bị quá thời gian chờ (30s). Kiểm tra kết nối mạng.');
         }
-        if (attempt >= AI_CONFIG.MAX_RETRIES || error.message.includes('API Key') || error.message.includes('Quota')) {
-          throw error;
+        // FIX: error.message could be undefined (e.g. a raw string/network error was
+        // thrown), which previously crashed this catch block with a TypeError instead
+        // of surfacing the real error.
+        const msg: string = typeof error?.message === 'string' ? error.message : String(error);
+        if (attempt >= AI_CONFIG.MAX_RETRIES || msg.includes('API Key') || msg.includes('Quota')) {
+          throw error instanceof Error ? error : new Error(msg);
         }
+        // FIX: generic/network errors (e.g. "Network request failed" while offline)
+        // used to fall through and immediately retry with no delay at all — a tight
+        // loop that hammered the network instead of backing off. Now they honor the
+        // same exponential backoff + jitter as the 429/5xx paths above.
+        const jitter = Math.random() * 200;
+        await new Promise(res => setTimeout(res, delay + jitter));
+        delay *= 2;
       }
     }
   }
