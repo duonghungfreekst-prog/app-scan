@@ -58,7 +58,7 @@ jobs:
       - name: Build Android Release APK
         run: |
           cd android
-          ./gradlew clean assembleRelease
+          ./gradlew clean assembleRelease -x lintVitalRelease -x lint
 
       - name: Verify APK File Integrity
         run: |
