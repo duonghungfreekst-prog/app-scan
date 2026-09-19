@@ -11,6 +11,7 @@ import * as Sharing from 'expo-sharing';
 import { useFocusEffect } from '@react-navigation/native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useTheme } from '../theme';
+import Constants from 'expo-constants';
 
 type HomeScreenNavigationProp = CompositeNavigationProp<
   BottomTabNavigationProp<MainTabParamList, 'Home'>,
@@ -96,7 +97,7 @@ export default function HomeScreen({ navigation }: HomeScreenProps) {
           </View>
           <View style={s.premiumBadge}>
             <Ionicons name="shield-checkmark" size={14} color="#00e5cc" />
-            <Text style={s.premiumText}>v2.5.0</Text>
+            <Text style={s.premiumText}>v{Constants.expoConfig?.version || '2.6.0'}</Text>
           </View>
         </View>
       </LinearGradient>

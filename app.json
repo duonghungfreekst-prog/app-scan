@@ -46,7 +46,8 @@
         {}
       ],
       "expo-web-browser",
-      "react-native-document-scanner-plugin"
+      "react-native-document-scanner-plugin",
+      "expo-font"
     ]
   }
 }
