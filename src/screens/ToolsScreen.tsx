@@ -13,7 +13,7 @@ import { useTheme } from '../theme';
 
 import Storage from '../utils/storage';
 import { STORAGE_KEYS } from '../constants/config';
-import { listDocumentFiles, sanitizeFileName } from '../utils/fileHelper';
+import { listDocumentFiles, sanitizeFileName, saveDocumentOcrText } from '../utils/fileHelper';
 
 import GeminiService from '../services/ai/gemini.service';
 import MathSolverService from '../services/ai/math.solver';
@@ -201,35 +201,53 @@ export default function ToolsScreen({ route }: any) {
     }
   };
 
-  // 3. BOOK SCAN (Tách trang đôi)
+  // 3. BOOK SCAN (Quét sách)
   const handleBookScan = async () => {
-    try {
-      const scannedImages = await captureImageForProcessing();
-      if (scannedImages && scannedImages.length > 0) {
-        const bookUri = scannedImages[0];
-        showNameDialog(
-          'Đặt tên file sách tách trang',
-          `Book_${Math.floor(Date.now() / 1000)}`,
-          async (fileName) => {
-            setLoadingText('Đang tách trang sách thành PDF...');
-            setLoading(true);
+    Alert.alert(
+      '📖 Quét Sách Chuyên Dụng',
+      'Chọn phương thức quét sách bạn mong muốn:',
+      [
+        { text: 'Hủy', style: 'cancel' },
+        {
+          text: '📖 Nắn gáy cong (Dewarp)',
+          onPress: () => {
+            navigation.navigate('Scanner', { bookMode: true });
+          },
+        },
+        {
+          text: '📑 Tách trang đôi (2 trong 1)',
+          onPress: async () => {
             try {
-              await PdfToolsService.createSplitBookPdf(bookUri, fileName);
-              setLoading(false);
-              Alert.alert('✅ Thành công', 'Đã tách trang sách đôi thành 2 trang PDF riêng biệt!', [
-                { text: 'Xem tài liệu', onPress: () => navigation.navigate('Files') },
-                { text: 'OK', style: 'cancel' }
-              ]);
+              const scannedImages = await captureImageForProcessing();
+              if (scannedImages && scannedImages.length > 0) {
+                const bookUri = scannedImages[0];
+                showNameDialog(
+                  'Đặt tên file sách tách trang',
+                  `Book_${Math.floor(Date.now() / 1000)}`,
+                  async (fileName) => {
+                    setLoadingText('Đang tách trang sách thành PDF...');
+                    setLoading(true);
+                    try {
+                      await PdfToolsService.createSplitBookPdf(bookUri, fileName);
+                      setLoading(false);
+                      Alert.alert('✅ Thành công', 'Đã tách trang sách đôi thành 2 trang PDF riêng biệt!', [
+                        { text: 'Xem tài liệu', onPress: () => navigation.navigate('Files') },
+                        { text: 'OK', style: 'cancel' }
+                      ]);
+                    } catch {
+                      setLoading(false);
+                      Alert.alert('Lỗi', 'Không thể tạo PDF tách trang sách.');
+                    }
+                  }
+                );
+              }
             } catch {
-              setLoading(false);
-              Alert.alert('Lỗi', 'Không thể tạo PDF tách trang sách.');
+              Alert.alert('Lỗi', 'Không thể khởi chạy máy quét sách.');
             }
-          }
-        );
-      }
-    } catch {
-      Alert.alert('Lỗi', 'Không thể khởi chạy máy quét sách.');
-    }
+          },
+        },
+      ]
+    );
   };
 
   // 4. OCR NHẬN DIỆN CHỮ
@@ -572,16 +590,45 @@ export default function ToolsScreen({ route }: any) {
             <ScrollView style={s.resultScroll}>
               <Text style={[s.resultContent, { color: theme.text }]} selectable>{ocrResultText}</Text>
             </ScrollView>
-            <TouchableOpacity
-              style={[s.actionBtn, { backgroundColor: theme.accent }]}
-              onPress={async () => {
-                await Clipboard.setStringAsync(ocrResultText);
-                Alert.alert('Đã sao chép', 'Đã copy toàn bộ nội dung vào bộ nhớ tạm.');
-              }}
-            >
-              <Ionicons name="copy" size={18} color="#fff" style={{ marginRight: 8 }} />
-              <Text style={s.actionBtnText}>Sao chép văn bản</Text>
-            </TouchableOpacity>
+            <View style={{ flexDirection: 'row', gap: 10, marginTop: 12 }}>
+              <TouchableOpacity
+                style={[s.actionBtn, { backgroundColor: theme.accent, flex: 1, marginTop: 0 }]}
+                onPress={async () => {
+                  await Clipboard.setStringAsync(ocrResultText);
+                  Alert.alert('Đã sao chép', 'Đã copy toàn bộ nội dung vào bộ nhớ tạm.');
+                }}
+              >
+                <Ionicons name="copy" size={18} color="#fff" style={{ marginRight: 6 }} />
+                <Text style={s.actionBtnText}>Sao chép</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[s.actionBtn, { backgroundColor: theme.blue, flex: 1, marginTop: 0 }]}
+                onPress={async () => {
+                  const pdfs = await listDocumentFiles(['.pdf']);
+                  if (pdfs.length === 0) {
+                    Alert.alert('Thông báo', 'Chưa có file PDF nào trong máy để gắn dữ liệu tìm kiếm OCR.');
+                    return;
+                  }
+                  Alert.alert(
+                    '🔍 Gắn vào tài liệu PDF',
+                    'Chọn tài liệu bạn muốn gắn nội dung OCR này vào để tìm kiếm toàn văn:',
+                    [
+                      { text: 'Đóng', style: 'cancel' },
+                      ...pdfs.slice(0, 4).map(pdfName => ({
+                        text: pdfName.length > 22 ? pdfName.substring(0, 19) + '...' : pdfName,
+                        onPress: async () => {
+                          await saveDocumentOcrText(pdfName, ocrResultText);
+                          Alert.alert('✅ Thành công', `Đã gắn OCR vào "${pdfName}". Bạn có thể tìm thấy file này khi tìm kiếm từ khóa nội dung trong mục Tài liệu!`);
+                        }
+                      }))
+                    ]
+                  );
+                }}
+              >
+                <Ionicons name="search" size={18} color="#fff" style={{ marginRight: 6 }} />
+                <Text style={s.actionBtnText}>Gắn tìm kiếm</Text>
+              </TouchableOpacity>
+            </View>
           </View>
         </View>
       </Modal>

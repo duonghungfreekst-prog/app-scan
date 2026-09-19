@@ -5,12 +5,16 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
+import * as DocumentPicker from 'expo-document-picker';
+import * as FileSystem from 'expo-file-system/legacy';
 import Storage from '../utils/storage';
 import SecureStorage from '../core/security/secureStorage';
 import Constants from 'expo-constants';
 import { useTheme } from '../theme';
 import { STORAGE_KEYS, CAPABILITY_MATRIX } from '../constants/config';
 import { ScanQuality, ColorMode } from '../types/domain';
+import { getGoogleClientId, saveGoogleClientId, checkGoogleConfigured } from '../utils/googleSync';
+import BackupService from '../services/backup/backup.service';
 
 const { width } = Dimensions.get('window');
 
@@ -20,6 +24,9 @@ export default function MeScreen({ navigation }: any) {
   const [colorMode, setColorMode] = useState<ColorMode>('color');
   const [saveOriginal, setSaveOriginal] = useState(true);
   const [geminiApiKey, setGeminiApiKey] = useState('');
+  const [googleClientIdAndroid, setGoogleClientIdAndroid] = useState('');
+  const [googleClientIdWeb, setGoogleClientIdWeb] = useState('');
+  const [isGoogleConfiguredState, setIsGoogleConfiguredState] = useState(false);
 
   // Modal Ma trận năng lực
   const [matrixVisible, setMatrixVisible] = useState(false);
@@ -32,10 +39,16 @@ export default function MeScreen({ navigation }: any) {
       const c = await Storage.getItem(STORAGE_KEYS.COLOR_MODE);
       const s = await Storage.getItem(STORAGE_KEYS.SAVE_ORIGINAL);
       const key = await SecureStorage.getItem(STORAGE_KEYS.GEMINI_API_KEY);
+      const { android, web } = await getGoogleClientId();
+      const googleReady = await checkGoogleConfigured();
+
       if (q) setScanQuality(q as ScanQuality);
       if (c) setColorMode(c as ColorMode);
       if (s !== null) setSaveOriginal(s === 'true');
       if (key) setGeminiApiKey(key);
+      if (android && !android.includes('YOUR_')) setGoogleClientIdAndroid(android);
+      if (web && !web.includes('YOUR_')) setGoogleClientIdWeb(web);
+      setIsGoogleConfiguredState(googleReady);
     } catch {
       console.warn('[MeScreen] Failed to load settings');
     }
@@ -86,6 +99,52 @@ export default function MeScreen({ navigation }: any) {
       }
     } catch {
       Alert.alert('Lỗi', 'Không thể lưu API Key an toàn. Vui lòng thử lại.');
+    }
+  };
+
+  const saveGoogleConfig = async () => {
+    try {
+      await saveGoogleClientId(googleClientIdAndroid, googleClientIdWeb);
+      const configured = await checkGoogleConfigured();
+      setIsGoogleConfiguredState(configured);
+      Alert.alert(
+        '✅ Cấu hình Google Cloud',
+        configured
+          ? 'Đã lưu Client ID thành công! Tính năng đồng bộ Google Drive & Google Photos đã sẵn sàng sử dụng.'
+          : 'Đã xóa cấu hình Client ID tùy chỉnh. Ứng dụng sẽ dùng cấu hình mặc định.'
+      );
+    } catch {
+      Alert.alert('Lỗi', 'Không thể lưu cấu hình Google.');
+    }
+  };
+
+  const handleExportBackup = async () => {
+    try {
+      await BackupService.createAndShareBackup();
+    } catch (e: any) {
+      Alert.alert('Lỗi sao lưu', e.message || 'Không thể tạo bản sao lưu.');
+    }
+  };
+
+  const handleImportBackup = async () => {
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: ['application/json', 'text/json', '*/*'],
+        copyToCacheDirectory: true,
+      });
+      if (!result.canceled && result.assets && result.assets.length > 0) {
+        const fileUri = result.assets[0].uri;
+        const content = await FileSystem.readAsStringAsync(fileUri, {
+          encoding: FileSystem.EncodingType.UTF8,
+        });
+        const res = await BackupService.restoreFromJson(content);
+        if (res.success) {
+          await loadSettings();
+          Alert.alert('✅ Khôi phục thành công', `Đã phục hồi ${res.restoredCount} mục cấu hình và dữ liệu OCR!`);
+        }
+      }
+    } catch (e: any) {
+      Alert.alert('Lỗi khôi phục', e.message || 'Không thể đọc tệp sao lưu.');
     }
   };
 
@@ -165,6 +224,58 @@ export default function MeScreen({ navigation }: any) {
         </View>
       </View>
 
+      {/* Google Cloud OAuth Config */}
+      <View style={[s.section, { backgroundColor: theme.card, borderColor: theme.border }]}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+            <Ionicons name="cloud-upload" size={18} color={theme.blue} style={{ marginRight: 6 }} />
+            <Text style={[s.sectionTitle, { color: theme.text, marginBottom: 0 }]}>Đồng bộ Google Drive & Photos</Text>
+          </View>
+          <View style={[s.statusBadge, { backgroundColor: isGoogleConfiguredState ? '#43a04720' : '#ffa00020' }]}>
+            <Text style={{ fontSize: 11, fontWeight: 'bold', color: isGoogleConfiguredState ? theme.green : theme.warn }}>
+              {isGoogleConfiguredState ? '🟢 Sẵn sàng' : '⚪ Chưa cấu hình'}
+            </Text>
+          </View>
+        </View>
+        <Text style={[s.switchDesc, { color: theme.textSub, marginBottom: 12 }]}>
+          Cấu hình Google Cloud OAuth 2.0 Client ID (Android / Web) để tự động sao lưu tài liệu lên Drive và ảnh quét lên Photos.
+        </Text>
+        <TextInput
+          style={[s.apiKeyInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface, marginBottom: 8 }]}
+          placeholder="Android Client ID (xxx.apps.googleusercontent.com)"
+          placeholderTextColor={theme.textMuted}
+          value={googleClientIdAndroid}
+          onChangeText={setGoogleClientIdAndroid}
+          autoCapitalize="none"
+        />
+        <TextInput
+          style={[s.apiKeyInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface, marginBottom: 12 }]}
+          placeholder="Web Client ID (xxx.apps.googleusercontent.com)"
+          placeholderTextColor={theme.textMuted}
+          value={googleClientIdWeb}
+          onChangeText={setGoogleClientIdWeb}
+          autoCapitalize="none"
+        />
+        <View style={{ flexDirection: 'row', gap: 10 }}>
+          <TouchableOpacity style={[s.saveKeyBtn, { backgroundColor: theme.blue }]} onPress={saveGoogleConfig}>
+            <Text style={s.saveKeyText}>Lưu Cấu Hình Google</Text>
+          </TouchableOpacity>
+          {(googleClientIdAndroid.length > 0 || googleClientIdWeb.length > 0) && (
+            <TouchableOpacity
+              style={[s.saveKeyBtn, { backgroundColor: theme.surface, borderWidth: 1, borderColor: theme.border }]}
+              onPress={() => {
+                setGoogleClientIdAndroid('');
+                setGoogleClientIdWeb('');
+                saveGoogleClientId('', '');
+                setIsGoogleConfiguredState(false);
+              }}
+            >
+              <Text style={[s.saveKeyText, { color: theme.danger }]}>Xóa</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      </View>
+
       {/* Scan Quality */}
       <View style={[s.section, { backgroundColor: theme.card, borderColor: theme.border }]}>
         <Text style={[s.sectionTitle, { color: theme.text }]}>📷 Chất lượng quét</Text>
@@ -224,6 +335,37 @@ export default function MeScreen({ navigation }: any) {
             trackColor={{ false: theme.switchTrackOff, true: theme.accent }}
             thumbColor="#fff"
           />
+        </View>
+      </View>
+
+      {/* Backup & Restore Section */}
+      <View style={[s.section, { backgroundColor: theme.card, borderColor: theme.border }]}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 8 }}>
+          <Ionicons name="archive" size={18} color={theme.accent} style={{ marginRight: 6 }} />
+          <Text style={[s.sectionTitle, { color: theme.text, marginBottom: 0 }]}>Sao lưu & Khôi phục toàn diện</Text>
+        </View>
+        <Text style={[s.switchDesc, { color: theme.textSub, marginBottom: 14 }]}>
+          Xuất toàn bộ cấu hình, cài đặt chất lượng, chỉ mục OCR và tài khoản ra file JSON an toàn để lưu trữ hoặc chuyển thiết bị.
+        </Text>
+        <View style={{ flexDirection: 'row', gap: 10 }}>
+          <TouchableOpacity
+            style={[s.saveKeyBtn, { backgroundColor: theme.accent, flex: 1 }]}
+            onPress={handleExportBackup}
+          >
+            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+              <Ionicons name="download-outline" size={18} color="#fff" style={{ marginRight: 6 }} />
+              <Text style={s.saveKeyText}>Sao lưu (JSON)</Text>
+            </View>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[s.saveKeyBtn, { backgroundColor: theme.surface, borderWidth: 1, borderColor: theme.border, flex: 1 }]}
+            onPress={handleImportBackup}
+          >
+            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+              <Ionicons name="cloud-upload-outline" size={18} color={theme.text} style={{ marginRight: 6 }} />
+              <Text style={[s.saveKeyText, { color: theme.text }]}>Khôi phục</Text>
+            </View>
+          </TouchableOpacity>
         </View>
       </View>
 

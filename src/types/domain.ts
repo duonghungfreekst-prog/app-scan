@@ -14,6 +14,7 @@ export interface DocumentItem {
   size: number;
   modificationTime: number;
   extension: string;
+  ocrText?: string;
 }
 
 export interface CropPoint {

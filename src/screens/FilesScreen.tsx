@@ -1,14 +1,15 @@
 import React, { useState, useCallback } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, ScrollView, Alert, Modal,
-  TextInput, Platform
+  TextInput, Platform, ActivityIndicator
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import * as FileSystem from 'expo-file-system/legacy';
 import {
   getDocumentDirectory, copyFileToDocuments, listDocumentItems,
-  DocumentItem, sanitizeFileName
+  DocumentItem, sanitizeFileName, removeDocumentOcrText, renameDocumentOcrText
 } from '../utils/fileHelper';
+import { signInWithGoogle, uploadToGoogleDrive } from '../utils/googleSync';
 import * as Sharing from 'expo-sharing';
 import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
@@ -23,6 +24,7 @@ export default function FilesScreen() {
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [folderDialogVisible, setFolderDialogVisible] = useState(false);
   const [folderName, setFolderName] = useState('');
+  const [syncingGoogle, setSyncingGoogle] = useState(false);
 
   // File action modal & rename
   const [selectedItem, setSelectedItem] = useState<DocumentItem | null>(null);
@@ -72,6 +74,31 @@ export default function FilesScreen() {
     }
   };
 
+  const handleUploadToGoogleDrive = async (item: DocumentItem) => {
+    try {
+      setSyncingGoogle(true);
+      const token = await signInWithGoogle();
+      if (!token) {
+        setSyncingGoogle(false);
+        return;
+      }
+      const mimeType = item.name.endsWith('.pdf')
+        ? 'application/pdf'
+        : item.name.endsWith('.docx')
+        ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        : item.name.endsWith('.xlsx')
+        ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        : 'application/octet-stream';
+
+      await uploadToGoogleDrive(token, item.uri, mimeType, item.name);
+      setSyncingGoogle(false);
+      Alert.alert('✅ Thành công', `Đã tải tập tin "${item.name}" lên Google Drive an toàn!`);
+    } catch (e: any) {
+      setSyncingGoogle(false);
+      Alert.alert('Lỗi tải lên', e.message || 'Không thể upload lên Google Drive.');
+    }
+  };
+
   const handleDeleteItem = (item: DocumentItem) => {
     const isFolder = item.isDirectory;
     Alert.alert('Xác nhận', `Bạn có chắc muốn xóa ${isFolder ? 'thư mục' : 'tập tin'} "${item.name}"?`, [
@@ -82,6 +109,7 @@ export default function FilesScreen() {
         onPress: async () => {
           try {
             await FileSystem.deleteAsync(item.uri, { idempotent: true });
+            await removeDocumentOcrText(item.name);
             setActionModalVisible(false);
             setSelectedItem(null);
             loadFiles();
@@ -116,6 +144,7 @@ export default function FilesScreen() {
       const newUri = targetDir + newFileName;
 
       await FileSystem.moveAsync({ from: selectedItem.uri, to: newUri });
+      await renameDocumentOcrText(selectedItem.name, newFileName);
       setRenameDialogVisible(false);
       setSelectedItem(null);
       loadFiles();
@@ -211,9 +240,22 @@ export default function FilesScreen() {
     setCurrentFolder(parts.join('/'));
   };
 
-  const filteredItems = items.filter(item =>
-    item.name.toLowerCase().includes(searchQuery.toLowerCase().trim())
-  );
+  const trimmedQuery = searchQuery.toLowerCase().trim();
+  const filteredItems = items.filter(item => {
+    if (!trimmedQuery) return true;
+    const nameMatch = item.name.toLowerCase().includes(trimmedQuery);
+    const ocrMatch = item.ocrText && item.ocrText.toLowerCase().includes(trimmedQuery);
+    return nameMatch || ocrMatch;
+  });
+
+  const getOcrSnippet = (text: string, query: string): string => {
+    const lower = text.toLowerCase();
+    const idx = lower.indexOf(query);
+    if (idx === -1) return text.substring(0, 45).replace(/[\r\n]+/g, ' ');
+    const start = Math.max(0, idx - 15);
+    const end = Math.min(text.length, idx + query.length + 25);
+    return text.substring(start, end).replace(/[\r\n]+/g, ' ');
+  };
 
   return (
     <View style={[s.container, { backgroundColor: theme.bg }]}>
@@ -247,7 +289,7 @@ export default function FilesScreen() {
           <Ionicons name="search" size={18} color={theme.textMuted} style={{ marginRight: 8 }} />
           <TextInput
             style={[s.searchInput, { color: theme.text }]}
-            placeholder="Tìm kiếm tài liệu..."
+            placeholder="Tìm kiếm theo tên hoặc nội dung chữ..."
             placeholderTextColor={theme.textMuted}
             value={searchQuery}
             onChangeText={setSearchQuery}
@@ -273,7 +315,7 @@ export default function FilesScreen() {
           <View style={[s.emptyCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
             <Ionicons name="documents-outline" size={52} color={theme.textMuted} />
             <Text style={[s.emptyText, { color: theme.textMuted }]}>
-              {searchQuery ? 'Không tìm thấy tài liệu phù hợp.' : 'Thư mục này đang trống.'}
+              {searchQuery ? 'Không tìm thấy tài liệu phù hợp tên hoặc nội dung.' : 'Thư mục này đang trống.'}
             </Text>
           </View>
         ) : (
@@ -297,6 +339,11 @@ export default function FilesScreen() {
                   <Text style={[s.fileMeta, { color: theme.textSub }]}>
                     {visual.label} {sizeStr ? `• ${sizeStr}` : ''}
                   </Text>
+                  {trimmedQuery.length > 0 && item.ocrText && item.ocrText.toLowerCase().includes(trimmedQuery) && (
+                    <Text style={[s.ocrSnippet, { color: theme.accent }]} numberOfLines={1}>
+                      🔍 Khớp nội dung: "{getOcrSnippet(item.ocrText, trimmedQuery)}"
+                    </Text>
+                  )}
                 </View>
 
                 {!item.isDirectory && (
@@ -397,10 +444,34 @@ export default function FilesScreen() {
                   </View>
                   <View style={{ flex: 1 }}>
                     <Text style={[s.actionRowText, { color: theme.text }]}>Chia sẻ tập tin</Text>
-                    <Text style={{ fontSize: 12, color: theme.textSub }}>Gửi qua Zalo, Drive, Gmail, Bluetooth...</Text>
+                    <Text style={{ fontSize: 12, color: theme.textSub }}>Gửi qua Zalo, Mail, Bluetooth, Tin nhắn...</Text>
                   </View>
                   <Ionicons name="chevron-forward" size={18} color={theme.textMuted} />
                 </TouchableOpacity>
+
+                {!selectedItem.isDirectory && (
+                  <TouchableOpacity
+                    style={s.actionRow}
+                    onPress={() => {
+                      setActionModalVisible(false);
+                      handleUploadToGoogleDrive(selectedItem);
+                    }}
+                    disabled={syncingGoogle}
+                  >
+                    <View style={[s.actionRowIcon, { backgroundColor: theme.green + '20' }]}>
+                      {syncingGoogle ? (
+                        <ActivityIndicator size="small" color={theme.green} />
+                      ) : (
+                        <Ionicons name="cloud-upload-outline" size={20} color={theme.green} />
+                      )}
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={[s.actionRowText, { color: theme.text }]}>Tải lên Google Drive</Text>
+                      <Text style={{ fontSize: 12, color: theme.textSub }}>Sao lưu đám mây an toàn với tài khoản Google</Text>
+                    </View>
+                    <Ionicons name="chevron-forward" size={18} color={theme.textMuted} />
+                  </TouchableOpacity>
+                )}
 
                 <TouchableOpacity
                   style={s.actionRow}
@@ -547,6 +618,11 @@ const s: any = StyleSheet.create({
   fileInfo: { flex: 1 },
   fileName: { fontSize: 15, fontWeight: '600', marginBottom: 3 },
   fileMeta: { fontSize: 12 },
+  ocrSnippet: {
+    fontSize: 12,
+    marginTop: 3,
+    fontStyle: 'italic',
+  },
   iconBtn: {
     width: 36,
     height: 36,

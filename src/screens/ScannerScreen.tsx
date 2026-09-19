@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, Image, TextInput,
   ScrollView, Alert, KeyboardAvoidingView, Platform, Dimensions, ActivityIndicator,
-  FlatList
+  FlatList, Modal
 } from 'react-native';
 
 import * as Print from 'expo-print';
@@ -47,6 +47,10 @@ export default function ScannerScreen({ route, navigation }: any) {
   const [scanQuality, setScanQuality] = useState<'high' | 'medium' | 'low'>('high');
   const [saveOriginal, setSaveOriginal] = useState(true);
   const [trimMargin, setTrimMargin] = useState(true); // Default to true to remove excess borders
+  const [bookMode, setBookMode] = useState<boolean>(route.params?.bookMode || false);
+  const [watermark, setWatermark] = useState<string>('');
+  const [watermarkModalVisible, setWatermarkModalVisible] = useState<boolean>(false);
+  const [customWatermarkInput, setCustomWatermarkInput] = useState<string>('');
   const [fileName, setFileName] = useState(genDefaultFileName());
   const [saving, setSaving] = useState(false);
   const [sharing, setSharing] = useState(false);
@@ -71,6 +75,7 @@ export default function ScannerScreen({ route, navigation }: any) {
               images,
               fileName,
               filterMode,
+              bookMode,
               timestamp: Date.now(),
             })
           );
@@ -82,7 +87,7 @@ export default function ScannerScreen({ route, navigation }: any) {
       }
     };
     saveDraft();
-  }, [images, fileName, filterMode, sessionChecked]);
+  }, [images, fileName, filterMode, bookMode, sessionChecked]);
 
   useEffect(() => {
     // Tải cấu hình từ Cài đặt
@@ -215,6 +220,7 @@ export default function ScannerScreen({ route, navigation }: any) {
                     setImages(draft.images);
                     if (draft.fileName) setFileName(draft.fileName);
                     if (draft.filterMode) setFilterMode(draft.filterMode);
+                    if (typeof draft.bookMode === 'boolean') setBookMode(draft.bookMode);
                     setSessionChecked(true);
                   },
                 },
@@ -257,6 +263,54 @@ export default function ScannerScreen({ route, navigation }: any) {
       await Storage.removeItem(DRAFT_SCAN_SESSION_KEY);
       navigation.goBack();
     }
+  };
+
+  const handleRotateImage = async (index: number) => {
+    try {
+      const targetUri = images[index];
+      const manipResult = await ImageManipulator.manipulateAsync(
+        targetUri,
+        [{ rotate: 90 }],
+        { compress: 1, format: ImageManipulator.SaveFormat.JPEG }
+      );
+      const updated = [...images];
+      updated[index] = manipResult.uri;
+      setImages(updated);
+
+      if (customCorners[index]) {
+        setCustomCorners(prev => {
+          const next = { ...prev };
+          next[index] = next[index].map(pt => ({
+            x: Math.max(0, Math.min(1, 1 - pt.y)),
+            y: Math.max(0, Math.min(1, pt.x)),
+          }));
+          return next;
+        });
+      }
+    } catch (err) {
+      console.warn('[Scanner] Rotate image error:', err);
+      Alert.alert('Lỗi', 'Không thể xoay ảnh này.');
+    }
+  };
+
+  const handleMoveImage = (index: number, direction: 'left' | 'right') => {
+    const targetIdx = direction === 'left' ? index - 1 : index + 1;
+    if (targetIdx < 0 || targetIdx >= images.length) return;
+
+    const newImages = [...images];
+    const temp = newImages[index];
+    newImages[index] = newImages[targetIdx];
+    newImages[targetIdx] = temp;
+    setImages(newImages);
+
+    setCustomCorners(prev => {
+      const next = { ...prev };
+      const cCurrent = next[index];
+      const cTarget = next[targetIdx];
+      if (cCurrent) next[targetIdx] = cCurrent; else delete next[targetIdx];
+      if (cTarget) next[index] = cTarget; else delete next[index];
+      return next;
+    });
   };
 
   const createPdf = async () => {
@@ -305,6 +359,7 @@ export default function ScannerScreen({ route, navigation }: any) {
           }
           return `<div class="page">
             <img id="scanImg_${actualIndex}" src="${fileUri}" style="${filterMode !== 'magic' ? `filter: ${cssFilter};` : ''}" crossorigin="anonymous" />
+            ${watermark ? `<div class="watermark">${watermark}</div>` : ''}
           </div>`;
         })
       );
@@ -329,12 +384,29 @@ export default function ScannerScreen({ route, navigation }: any) {
               page-break-after: always;
               overflow: hidden;
               background: white;
+              position: relative;
             }
             .page img, .page canvas {
               width: 100%;
               height: 100%;
               object-fit: contain;
               display: block;
+            }
+            .watermark {
+              position: absolute;
+              top: 45%;
+              left: 5%;
+              width: 90%;
+              transform: rotate(-30deg);
+              font-size: 85px;
+              font-family: Arial, Helvetica, sans-serif;
+              color: rgba(220, 53, 69, 0.28);
+              font-weight: 900;
+              text-align: center;
+              pointer-events: none;
+              text-transform: uppercase;
+              letter-spacing: 12px;
+              z-index: 99;
             }
           </style>
         </head>
@@ -355,7 +427,7 @@ export default function ScannerScreen({ route, navigation }: any) {
                       trimMarginPercent: trimP,
                       contrast: ${scanContrast},
                       enablePerspectiveWarp: true,
-                      bookMode: false // Scan thông thường: không chạy dewarp bẻ cong ảnh
+                      bookMode: ${bookMode} // Chế độ quét sách: nắn thẳng gáy sách cong nếu bật
                     };
                     if (customMap[i]) {
                       opts.customCornersRatio = customMap[i];
@@ -490,27 +562,66 @@ export default function ScannerScreen({ route, navigation }: any) {
             <View style={styles.slide}>
               <View style={styles.imageCardWrapper}>
                 <Image source={{ uri: item }} style={styles.previewImage} resizeMode="contain" />
-                
-                {/* Crop Button */}
-                <TouchableOpacity style={styles.cropBtn} onPress={() => { setActiveIndex(index); setIsCropping(true); }}>
-                  <Ionicons name="crop" size={24} color="#fff" />
-                </TouchableOpacity>
 
-                <TouchableOpacity style={styles.deleteBtn} onPress={() => handleDeleteImage(index)}>
-                  <Ionicons name="trash" size={24} color="#fff" />
-                </TouchableOpacity>
-                {filterMode === 'magic' && (
-                  <View style={styles.magicBadge}>
-                    <Ionicons name="sparkles" size={12} color="#fff" />
-                    <Text style={styles.magicBadgeText}>Thuật toán Magic</Text>
-                  </View>
-                )}
-                {customCorners[index] && (
-                  <View style={[styles.magicBadge, { top: 44, backgroundColor: 'rgba(255,152,0,0.9)' }]}>
-                    <Ionicons name="scan-outline" size={12} color="#fff" />
-                    <Text style={styles.magicBadgeText}>Đã căn lề</Text>
-                  </View>
-                )}
+                {/* Page Number Badge */}
+                <View style={styles.pageBadge}>
+                  <Text style={styles.pageBadgeText}>{index + 1}/{images.length}</Text>
+                </View>
+
+                {/* Status Badges */}
+                <View style={styles.badgeContainer}>
+                  {filterMode === 'magic' && (
+                    <View style={styles.magicBadge}>
+                      <Ionicons name="sparkles" size={12} color="#fff" />
+                      <Text style={styles.magicBadgeText}>Thuật toán Magic</Text>
+                    </View>
+                  )}
+                  {customCorners[index] && (
+                    <View style={[styles.magicBadge, { backgroundColor: 'rgba(255,152,0,0.9)' }]}>
+                      <Ionicons name="scan-outline" size={12} color="#fff" />
+                      <Text style={styles.magicBadgeText}>Đã căn lề</Text>
+                    </View>
+                  )}
+                  {bookMode && (
+                    <View style={[styles.magicBadge, { backgroundColor: '#e65100' }]}>
+                      <Ionicons name="book-outline" size={12} color="#fff" />
+                      <Text style={styles.magicBadgeText}>Nắn gáy sách</Text>
+                    </View>
+                  )}
+                </View>
+                
+                {/* Reorder Buttons (Bottom Left) */}
+                <View style={styles.reorderBar}>
+                  <TouchableOpacity
+                    style={[styles.smallCardBtn, index === 0 && styles.disabledBtn]}
+                    onPress={() => handleMoveImage(index, 'left')}
+                    disabled={index === 0}
+                  >
+                    <Ionicons name="chevron-back" size={18} color="#fff" />
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.smallCardBtn, index === images.length - 1 && styles.disabledBtn]}
+                    onPress={() => handleMoveImage(index, 'right')}
+                    disabled={index === images.length - 1}
+                  >
+                    <Ionicons name="chevron-forward" size={18} color="#fff" />
+                  </TouchableOpacity>
+                </View>
+
+                {/* Action Buttons (Bottom Right): Rotate, Crop, Delete */}
+                <View style={styles.actionsBar}>
+                  <TouchableOpacity style={styles.smallCardBtn} onPress={() => handleRotateImage(index)}>
+                    <Ionicons name="refresh" size={18} color="#fff" />
+                  </TouchableOpacity>
+
+                  <TouchableOpacity style={styles.smallCardBtn} onPress={() => { setActiveIndex(index); setIsCropping(true); }}>
+                    <Ionicons name="crop" size={18} color="#fff" />
+                  </TouchableOpacity>
+
+                  <TouchableOpacity style={[styles.smallCardBtn, { backgroundColor: 'rgba(220,53,69,0.85)' }]} onPress={() => handleDeleteImage(index)}>
+                    <Ionicons name="trash" size={18} color="#fff" />
+                  </TouchableOpacity>
+                </View>
               </View>
             </View>
           )}
@@ -534,6 +645,25 @@ export default function ScannerScreen({ route, navigation }: any) {
 
       <View style={styles.colorModeRow}>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.modeScroll}>
+          <TouchableOpacity
+            style={[styles.modeBtn, bookMode && styles.bookModeActiveBtn]}
+            onPress={() => setBookMode(!bookMode)}
+          >
+            <Text style={[styles.modeBtnText, bookMode && styles.bookModeActiveText]}>
+              📖 Quét Sách {bookMode ? '(Bật)' : ''}
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.modeBtn, watermark.length > 0 && { backgroundColor: '#e91e63', borderColor: '#e91e63' }]}
+            onPress={() => {
+              setCustomWatermarkInput(watermark);
+              setWatermarkModalVisible(true);
+            }}
+          >
+            <Text style={[styles.modeBtnText, watermark.length > 0 && { color: '#fff', fontWeight: 'bold' }]}>
+              🔖 {watermark ? `Dấu: ${watermark}` : 'Đóng dấu'}
+            </Text>
+          </TouchableOpacity>
           <TouchableOpacity style={[styles.modeBtn, filterMode === 'magic' && styles.modeBtnActive]} onPress={() => setFilterMode('magic')}>
             <Text style={[styles.modeBtnText, filterMode === 'magic' && styles.modeBtnTextActive]}>✨ Giấy Thật</Text>
           </TouchableOpacity>
@@ -548,6 +678,85 @@ export default function ScannerScreen({ route, navigation }: any) {
           </TouchableOpacity>
         </ScrollView>
       </View>
+
+      {/* Watermark Dialog */}
+      <Modal visible={watermarkModalVisible} transparent animationType="fade">
+        <View style={styles.modalBg}>
+          <View style={styles.watermarkDialog}>
+            <View style={styles.watermarkHeader}>
+              <Text style={styles.watermarkTitle}>🔖 Đóng dấu bản quyền PDF</Text>
+              <TouchableOpacity onPress={() => setWatermarkModalVisible(false)}>
+                <Ionicons name="close" size={24} color="#fff" />
+              </TouchableOpacity>
+            </View>
+            <Text style={styles.watermarkDesc}>
+              Chọn mẫu dấu bản quyền hoặc nhập chữ tùy chọn in chìm chéo lên các trang tài liệu:
+            </Text>
+
+            <View style={styles.watermarkPresets}>
+              {[
+                { label: 'BẢN SAO', val: 'BẢN SAO' },
+                { label: 'TÀI LIỆU MẬT', val: 'TÀI LIỆU MẬT' },
+                { label: 'XÁC THỰC CCCD', val: 'CHỈ DÙNG XÁC THỰC' },
+                { label: 'DOCSCAN PRO', val: 'DOCSCAN PRO' },
+              ].map(preset => (
+                <TouchableOpacity
+                  key={preset.val}
+                  style={[
+                    styles.watermarkPresetBtn,
+                    watermark === preset.val && styles.watermarkPresetActive,
+                  ]}
+                  onPress={() => {
+                    setWatermark(preset.val);
+                    setCustomWatermarkInput(preset.val);
+                  }}
+                >
+                  <Text
+                    style={[
+                      styles.watermarkPresetText,
+                      watermark === preset.val && { color: '#fff', fontWeight: 'bold' },
+                    ]}
+                  >
+                    {preset.label}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            <TextInput
+              style={styles.watermarkInput}
+              value={customWatermarkInput}
+              onChangeText={setCustomWatermarkInput}
+              placeholder="Hoặc nhập chữ đóng dấu tùy ý..."
+              placeholderTextColor="#777"
+            />
+
+            <View style={styles.watermarkActions}>
+              {watermark.length > 0 && (
+                <TouchableOpacity
+                  style={[styles.watermarkBtn, { backgroundColor: '#333', marginRight: 10 }]}
+                  onPress={() => {
+                    setWatermark('');
+                    setCustomWatermarkInput('');
+                    setWatermarkModalVisible(false);
+                  }}
+                >
+                  <Text style={{ color: '#ff5252', fontWeight: 'bold' }}>Tắt dấu</Text>
+                </TouchableOpacity>
+              )}
+              <TouchableOpacity
+                style={[styles.watermarkBtn, { backgroundColor: '#00bfa5', flex: 1 }]}
+                onPress={() => {
+                  setWatermark(customWatermarkInput.trim());
+                  setWatermarkModalVisible(false);
+                }}
+              >
+                <Text style={{ color: '#fff', fontWeight: 'bold' }}>Áp dụng</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
 
       <View style={styles.footer}>
         <View style={styles.fileNameContainer}>
@@ -605,22 +814,36 @@ const styles = StyleSheet.create({
     elevation: 8,
   },
   previewImage: { width: '100%', height: '100%' },
-  cropBtn: {
-    position: 'absolute', bottom: 16, right: 70,
-    backgroundColor: 'rgba(0,0,0,0.6)', width: 44, height: 44,
-    borderRadius: 22, justifyContent: 'center', alignItems: 'center'
+  pageBadge: {
+    position: 'absolute', top: 12, left: 12,
+    backgroundColor: 'rgba(0,0,0,0.65)', paddingVertical: 4, paddingHorizontal: 8,
+    borderRadius: 12, zIndex: 10
   },
-  deleteBtn: {
-    position: 'absolute', bottom: 16, right: 16,
-    backgroundColor: 'rgba(220,53,69,0.8)', width: 44, height: 44,
-    borderRadius: 22, justifyContent: 'center', alignItems: 'center'
+  pageBadgeText: { color: '#fff', fontSize: 12, fontWeight: '700' },
+  badgeContainer: {
+    position: 'absolute', top: 12, right: 12,
+    alignItems: 'flex-end', gap: 6, zIndex: 10
   },
   magicBadge: {
-    position: 'absolute', top: 12, right: 12,
-    backgroundColor: 'rgba(0, 191, 165, 0.9)', paddingVertical: 6, paddingHorizontal: 10,
-    borderRadius: 16, flexDirection: 'row', alignItems: 'center', gap: 4
+    backgroundColor: 'rgba(0, 191, 165, 0.9)', paddingVertical: 4, paddingHorizontal: 8,
+    borderRadius: 14, flexDirection: 'row', alignItems: 'center', gap: 4
   },
-  magicBadgeText: { color: '#fff', fontSize: 12, fontWeight: 'bold' },
+  magicBadgeText: { color: '#fff', fontSize: 11, fontWeight: 'bold' },
+  reorderBar: {
+    position: 'absolute', bottom: 12, left: 12,
+    flexDirection: 'row', gap: 8, zIndex: 10
+  },
+  actionsBar: {
+    position: 'absolute', bottom: 12, right: 12,
+    flexDirection: 'row', gap: 8, zIndex: 10
+  },
+  smallCardBtn: {
+    backgroundColor: 'rgba(0,0,0,0.65)', width: 38, height: 38,
+    borderRadius: 19, justifyContent: 'center', alignItems: 'center'
+  },
+  disabledBtn: { opacity: 0.3 },
+  bookModeActiveBtn: { backgroundColor: '#ff9800', borderColor: '#ff9800' },
+  bookModeActiveText: { color: '#fff', fontWeight: 'bold' },
 
   colorModeRow: {
     paddingVertical: 12, backgroundColor: '#1a1a1a',
@@ -648,5 +871,36 @@ const styles = StyleSheet.create({
     backgroundColor: '#00bfa5', flexDirection: 'row', alignItems: 'center',
     height: 44, paddingHorizontal: 16, borderRadius: 8
   },
-  saveBtnText: { color: '#fff', fontSize: 15, fontWeight: 'bold' }
+  saveBtnText: { color: '#fff', fontSize: 15, fontWeight: 'bold' },
+
+  modalBg: {
+    flex: 1, backgroundColor: 'rgba(0,0,0,0.65)',
+    justifyContent: 'center', alignItems: 'center', padding: 20
+  },
+  watermarkDialog: {
+    width: '94%', backgroundColor: '#1e1e1e', borderRadius: 16,
+    padding: 20, borderWidth: 1, borderColor: '#333'
+  },
+  watermarkHeader: {
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12
+  },
+  watermarkTitle: { color: '#fff', fontSize: 17, fontWeight: 'bold' },
+  watermarkDesc: { color: '#aaa', fontSize: 13, marginBottom: 16, lineHeight: 18 },
+  watermarkPresets: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 16 },
+  watermarkPresetBtn: {
+    paddingVertical: 8, paddingHorizontal: 12, borderRadius: 12,
+    backgroundColor: '#2a2a2a', borderWidth: 1, borderColor: '#3a3a3a'
+  },
+  watermarkPresetActive: { backgroundColor: '#e91e63', borderColor: '#e91e63' },
+  watermarkPresetText: { color: '#bbb', fontSize: 12 },
+  watermarkInput: {
+    height: 44, backgroundColor: '#2a2a2a', borderRadius: 10,
+    borderWidth: 1, borderColor: '#3a3a3a', paddingHorizontal: 14,
+    color: '#fff', fontSize: 14, marginBottom: 18
+  },
+  watermarkActions: { flexDirection: 'row', justifyContent: 'flex-end' },
+  watermarkBtn: {
+    height: 42, borderRadius: 10, justifyContent: 'center', alignItems: 'center',
+    paddingHorizontal: 18
+  }
 });

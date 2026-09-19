@@ -8,6 +8,8 @@
 
 import * as FileSystem from 'expo-file-system/legacy';
 import { DocumentItem } from '../types/domain';
+import Storage from './storage';
+import { STORAGE_KEYS } from '../constants/config';
 
 export { DocumentItem };
 
@@ -186,6 +188,80 @@ export async function copyFileToDocuments(
 export const DEFAULT_SUPPORTED_EXTENSIONS = ['.pdf', '.docx', '.xlsx', '.jpg', '.jpeg', '.png', '.txt'];
 
 /**
+ * Lấy toàn bộ bộ chỉ mục OCR Metadata phục vụ tìm kiếm toàn văn (Full-Text Search)
+ */
+export async function getAllOcrIndex(): Promise<Record<string, string>> {
+  try {
+    const raw = await Storage.getItem(STORAGE_KEYS.OCR_METADATA_INDEX);
+    if (!raw) return {};
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Lưu chuỗi OCR nhận dạng được gắn với tài liệu (dùng tên file làm định danh)
+ */
+export async function saveDocumentOcrText(fileUriOrName: string, ocrText: string): Promise<void> {
+  try {
+    const index = await getAllOcrIndex();
+    const key = fileUriOrName.split('/').pop() || fileUriOrName;
+    index[key] = ocrText.trim();
+    await Storage.setItem(STORAGE_KEYS.OCR_METADATA_INDEX, JSON.stringify(index));
+  } catch (e) {
+    console.warn('[FileHelper] Error saving OCR metadata:', e);
+  }
+}
+
+/**
+ * Lấy OCR text của một file
+ */
+export async function getDocumentOcrText(fileUriOrName: string): Promise<string | null> {
+  try {
+    const index = await getAllOcrIndex();
+    const key = fileUriOrName.split('/').pop() || fileUriOrName;
+    return index[key] || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Xóa OCR metadata khi file bị xóa
+ */
+export async function removeDocumentOcrText(fileUriOrName: string): Promise<void> {
+  try {
+    const index = await getAllOcrIndex();
+    const key = fileUriOrName.split('/').pop() || fileUriOrName;
+    if (index[key]) {
+      delete index[key];
+      await Storage.setItem(STORAGE_KEYS.OCR_METADATA_INDEX, JSON.stringify(index));
+    }
+  } catch (e) {
+    console.warn('[FileHelper] Error removing OCR metadata:', e);
+  }
+}
+
+/**
+ * Cập nhật tên key OCR khi file được đổi tên
+ */
+export async function renameDocumentOcrText(oldName: string, newName: string): Promise<void> {
+  try {
+    const index = await getAllOcrIndex();
+    const oldKey = oldName.split('/').pop() || oldName;
+    const newKey = newName.split('/').pop() || newName;
+    if (index[oldKey]) {
+      index[newKey] = index[oldKey];
+      delete index[oldKey];
+      await Storage.setItem(STORAGE_KEYS.OCR_METADATA_INDEX, JSON.stringify(index));
+    }
+  } catch (e) {
+    console.warn('[FileHelper] Error renaming OCR metadata:', e);
+  }
+}
+
+/**
  * Đọc toàn bộ danh sách tập tin và thư mục kèm metadata chi tiết
  */
 export async function listDocumentItems(
@@ -201,6 +277,7 @@ export async function listDocumentItems(
       return [];
     }
 
+    const ocrIndex = await getAllOcrIndex();
     const fileNames = await FileSystem.readDirectoryAsync(targetDir);
     const items: DocumentItem[] = [];
 
@@ -226,6 +303,7 @@ export async function listDocumentItems(
             size: info.size ?? 0,
             modificationTime: (info as any).modificationTime ?? Date.now(),
             extension: ext,
+            ocrText: ocrIndex[name] || undefined,
           });
         }
       } catch (e) {

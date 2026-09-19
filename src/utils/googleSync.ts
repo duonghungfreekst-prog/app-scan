@@ -1,8 +1,51 @@
 import * as FileSystem from 'expo-file-system/legacy';
+import Storage from './storage';
+import { STORAGE_KEYS } from '../constants/config';
 
-// Client IDs — thay bằng ID thật từ Google Cloud Console để dùng tính năng đồng bộ
+// Client IDs mặc định — người dùng có thể cấu hình Client ID riêng trong màn hình Cài đặt
 export const GOOGLE_CLIENT_ID_ANDROID = 'YOUR_ANDROID_CLIENT_ID.apps.googleusercontent.com';
 export const GOOGLE_CLIENT_ID_WEB = 'YOUR_WEB_CLIENT_ID.apps.googleusercontent.com';
+
+/**
+ * Lấy Client ID hiện tại (ưu tiên Client ID người dùng đã lưu trong Storage)
+ */
+export const getGoogleClientId = async (): Promise<{ android: string; web: string }> => {
+  try {
+    const savedAndroid = await Storage.getItem(STORAGE_KEYS.GOOGLE_CLIENT_ID_ANDROID);
+    const savedWeb = await Storage.getItem(STORAGE_KEYS.GOOGLE_CLIENT_ID_WEB);
+    return {
+      android: (savedAndroid && savedAndroid.trim()) || GOOGLE_CLIENT_ID_ANDROID,
+      web: (savedWeb && savedWeb.trim()) || GOOGLE_CLIENT_ID_WEB,
+    };
+  } catch {
+    return { android: GOOGLE_CLIENT_ID_ANDROID, web: GOOGLE_CLIENT_ID_WEB };
+  }
+};
+
+/**
+ * Lưu Client ID cấu hình bởi người dùng
+ */
+export const saveGoogleClientId = async (android: string, web: string): Promise<void> => {
+  if (android && android.trim()) {
+    await Storage.setItem(STORAGE_KEYS.GOOGLE_CLIENT_ID_ANDROID, android.trim());
+  } else {
+    await Storage.removeItem(STORAGE_KEYS.GOOGLE_CLIENT_ID_ANDROID);
+  }
+
+  if (web && web.trim()) {
+    await Storage.setItem(STORAGE_KEYS.GOOGLE_CLIENT_ID_WEB, web.trim());
+  } else {
+    await Storage.removeItem(STORAGE_KEYS.GOOGLE_CLIENT_ID_WEB);
+  }
+};
+
+/**
+ * Kiểm tra xem Google Client ID đã được cấu hình hợp lệ hay chưa
+ */
+export const checkGoogleConfigured = async (): Promise<boolean> => {
+  const { android } = await getGoogleClientId();
+  return !android.includes('YOUR_') && android.trim().length > 0;
+};
 
 export const isGoogleConfigured =
   !GOOGLE_CLIENT_ID_ANDROID.includes('YOUR_') &&
@@ -18,11 +61,14 @@ const SCOPES = [
  * Trả về accessToken nếu thành công, null nếu thất bại/bị huỷ
  */
 export const signInWithGoogle = async (): Promise<string | null> => {
-  if (!isGoogleConfigured) {
+  const isConfigured = await checkGoogleConfigured();
+  const { android: clientIdAndroid } = await getGoogleClientId();
+
+  if (!isConfigured) {
     const { Alert } = require('react-native');
     Alert.alert(
-      '⚙️ Chưa cấu hình Google',
-      'Tính năng đồng bộ Google chưa được kích hoạt.\nVui lòng liên hệ nhà phát triển để cấu hình Google Client ID.'
+      '⚙️ Chưa cấu hình Google Cloud',
+      'Tính năng đồng bộ Google Drive & Photos yêu cầu Google OAuth Client ID.\n\nBạn có thể tự thêm Client ID của dự án Google Cloud cá nhân trong màn hình "Cài đặt (Tôi)" để sử dụng ngay.'
     );
     return null;
   }
@@ -34,7 +80,7 @@ export const signInWithGoogle = async (): Promise<string | null> => {
     const redirectUri = AuthSession.makeRedirectUri({ scheme: 'camscanner' });
     const authUrl =
       `https://accounts.google.com/o/oauth2/v2/auth` +
-      `?client_id=${GOOGLE_CLIENT_ID_ANDROID}` +
+      `?client_id=${clientIdAndroid}` +
       `&redirect_uri=${encodeURIComponent(redirectUri)}` +
       `&response_type=token` +
       `&scope=${encodeURIComponent(SCOPES)}`;

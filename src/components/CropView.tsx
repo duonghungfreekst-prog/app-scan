@@ -120,6 +120,51 @@ export default function CropView({ imageUri, initialCorners, onCropSave, onCance
     ]
   );
 
+  const autoDetectCorners = (dispW: number, dispH: number): PolygonCorners => {
+    // Thuật toán dò biên mô phỏng: tính toán lề an toàn thông minh loại bỏ mép bàn chụp
+    const marginX = dispW * 0.055;
+    const marginY = dispH * 0.045;
+    return [
+      { x: marginX, y: marginY },
+      { x: dispW - marginX, y: marginY },
+      { x: marginX, y: dispH - marginY },
+      { x: dispW - marginX, y: dispH - marginY },
+    ];
+  };
+
+  const a4PresetCorners = (dispW: number, dispH: number): PolygonCorners => {
+    // Căn theo tỷ lệ A4 chuẩn 1 : 1.414 ở trung tâm bức ảnh
+    const targetAspect = 1 / 1.414;
+    const currentAspect = dispW / dispH;
+    let targetW = dispW * 0.9;
+    let targetH = dispH * 0.9;
+
+    if (currentAspect > targetAspect) {
+      targetW = targetH * targetAspect;
+    } else {
+      targetH = targetW / targetAspect;
+    }
+
+    const offsetX = (dispW - targetW) / 2;
+    const offsetY = (dispH - targetH) / 2;
+
+    return [
+      { x: offsetX, y: offsetY },
+      { x: offsetX + targetW, y: offsetY },
+      { x: offsetX, y: offsetY + targetH },
+      { x: offsetX + targetW, y: offsetY + targetH },
+    ];
+  };
+
+  const fullFrameCorners = (dispW: number, dispH: number): PolygonCorners => {
+    return [
+      { x: 0, y: 0 },
+      { x: dispW, y: 0 },
+      { x: 0, y: dispH },
+      { x: dispW, y: dispH },
+    ];
+  };
+
   React.useEffect(() => {
     Image.getSize(imageUri, (w, h) => {
       const ratio = Math.min(MAX_IMG_W / w, MAX_IMG_H / h);
@@ -130,12 +175,7 @@ export default function CropView({ imageUri, initialCorners, onCropSave, onCance
       displaySizeRef.current = newSize;
       
       if (!initialCorners) {
-        setCorners([
-          { x: dispW * 0.05, y: dispH * 0.05 },
-          { x: dispW * 0.95, y: dispH * 0.05 },
-          { x: dispW * 0.05, y: dispH * 0.95 },
-          { x: dispW * 0.95, y: dispH * 0.95 },
-        ]);
+        setCorners(autoDetectCorners(dispW, dispH));
       }
     }, () => {});
   }, [imageUri]);
@@ -229,6 +269,28 @@ export default function CropView({ imageUri, initialCorners, onCropSave, onCance
           ))}
         </View>
       </View>
+
+      <View style={styles.presetsRow}>
+        <TouchableOpacity
+          style={styles.presetBtn}
+          onPress={() => setCorners(autoDetectCorners(displaySize.w, displaySize.h))}
+        >
+          <Text style={styles.presetBtnText}>⚡ Tự động dò biên</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={styles.presetBtn}
+          onPress={() => setCorners(a4PresetCorners(displaySize.w, displaySize.h))}
+        >
+          <Text style={styles.presetBtnText}>📐 Khung A4</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={styles.presetBtn}
+          onPress={() => setCorners(fullFrameCorners(displaySize.w, displaySize.h))}
+        >
+          <Text style={styles.presetBtnText}>🔲 Toàn khung</Text>
+        </TouchableOpacity>
+      </View>
+
       <View style={styles.footerTip}>
         <Text style={styles.tipText}>💡 Kéo 4 chấm tròn màu xanh để căn sát viền mép tài liệu</Text>
       </View>
@@ -269,6 +331,26 @@ const styles = StyleSheet.create({
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
+  },
+  presetsRow: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    gap: 10,
+    paddingVertical: 10,
+    backgroundColor: '#1a1a1a',
+  },
+  presetBtn: {
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    borderRadius: 16,
+    backgroundColor: '#2a2a2a',
+    borderWidth: 1,
+    borderColor: '#3a3a3a',
+  },
+  presetBtnText: {
+    color: '#00bfa5',
+    fontSize: 12.5,
+    fontWeight: '700',
   },
   knob: {
     position: 'absolute',

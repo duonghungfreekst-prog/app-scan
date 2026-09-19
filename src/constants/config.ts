@@ -12,6 +12,9 @@ export const STORAGE_KEYS = {
   CAM_PERM: '@camscanner_cam_perm',
   DRAFT_SCAN_SESSION: '@camscanner_draft_session_v1',
   APP_THEME: '@camscanner_theme_mode',
+  GOOGLE_CLIENT_ID_ANDROID: '@camscanner_google_client_id_android',
+  GOOGLE_CLIENT_ID_WEB: '@camscanner_google_client_id_web',
+  OCR_METADATA_INDEX: '@camscanner_ocr_metadata_index_v1',
 } as const;
 
 // Endpoints & Models

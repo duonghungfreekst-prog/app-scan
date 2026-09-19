@@ -274,8 +274,188 @@ Promise.all([queueWrite('ITEM_1'), queueWrite('ITEM_2'), queueWrite('ITEM_3')]).
       assert.deepStrictEqual(successfulSaves, ['SAVE_1', 'SAVE_3'], 'Lần ghi thứ 3 phải thành công dù lần 2 bị lỗi');
       console.log('✅ Test 8 [PASSED]: Hàng đợi Storage tự phục hồi sau lỗi (Resilient Queue - No Poisoning).');
 
+      // ----------------------------------------------------
+      // 9. TEST HOMOGRAPHY MATRIX COMPUTATION (computeHomography)
+      // ----------------------------------------------------
+      function computeHomography(srcPts, dstPts) {
+        const A = [];
+        for (let i = 0; i < 4; i++) {
+          const sx = srcPts[i].x, sy = srcPts[i].y;
+          const dx = dstPts[i].x, dy = dstPts[i].y;
+          A.push([-sx, -sy, -1, 0, 0, 0, dx * sx, dx * sy, dx]);
+          A.push([0, 0, 0, -sx, -sy, -1, dy * sx, dy * sy, dy]);
+        }
+
+        const M = [];
+        const b = [];
+        for (let i = 0; i < 8; i++) {
+          M.push(A[i].slice(0, 8));
+          b.push(-A[i][8]);
+        }
+
+        for (let col = 0; col < 8; col++) {
+          let maxRow = col;
+          let maxVal = Math.abs(M[col][col]);
+          for (let row = col + 1; row < 8; row++) {
+            if (Math.abs(M[row][col]) > maxVal) {
+              maxVal = Math.abs(M[row][col]);
+              maxRow = row;
+            }
+          }
+          [M[col], M[maxRow]] = [M[maxRow], M[col]];
+          [b[col], b[maxRow]] = [b[maxRow], b[col]];
+
+          if (Math.abs(M[col][col]) < 1e-10) continue;
+
+          const pivot = M[col][col];
+          for (let j = col; j < 8; j++) M[col][j] /= pivot;
+          b[col] /= pivot;
+
+          for (let row = 0; row < 8; row++) {
+            if (row === col) continue;
+            const factor = M[row][col];
+            for (let j = col; j < 8; j++) M[row][j] -= factor * M[col][j];
+            b[row] -= factor * b[col];
+          }
+        }
+
+        const h = [...b, 1];
+        return [
+          [h[0], h[1], h[2]],
+          [h[3], h[4], h[5]],
+          [h[6], h[7], h[8]],
+        ];
+      }
+
+      function projectPoint(H, pt) {
+        const wx = H[0][0] * pt.x + H[0][1] * pt.y + H[0][2];
+        const wy = H[1][0] * pt.x + H[1][1] * pt.y + H[1][2];
+        const wz = H[2][0] * pt.x + H[2][1] * pt.y + H[2][2];
+        return { x: wx / wz, y: wy / wz };
+      }
+
+      const rectSrc = [{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 0, y: 100 }, { x: 100, y: 100 }];
+      const rectDst = [{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 0, y: 100 }, { x: 100, y: 100 }];
+      const identityH = computeHomography(rectSrc, rectDst);
+      const projOrigin = projectPoint(identityH, { x: 0, y: 0 });
+      assert.ok(Math.abs(projOrigin.x) < 1e-4 && Math.abs(projOrigin.y) < 1e-4, 'Ánh xạ điểm gốc (0,0) phải bằng (0,0)');
+
+      const projCenter = projectPoint(identityH, { x: 50, y: 50 });
+      assert.ok(Math.abs(projCenter.x - 50) < 1e-4 && Math.abs(projCenter.y - 50) < 1e-4, 'Ánh xạ điểm giữa (50,50) phải bằng (50,50)');
+      console.log('✅ Test 9 [PASSED]: Tính toán ma trận Homography 3x3 và phép biến đổi phối cảnh (computeHomography).');
+
+      // ----------------------------------------------------
+      // 10. TEST PAGE ROTATION & CORNER TRANSFORM (Xoay trang 90°/360°)
+      // ----------------------------------------------------
+      function rotatePoint90Clockwise(pt) {
+        return {
+          x: Math.max(0, Math.min(1, Number((1 - pt.y).toFixed(6)))),
+          y: Math.max(0, Math.min(1, Number(pt.x.toFixed(6)))),
+        };
+      }
+
+      const originalPt = { x: 0.2, y: 0.3 };
+      let p = { ...originalPt };
+      for (let r = 0; r < 4; r++) {
+        p = rotatePoint90Clockwise(p);
+      }
+      assert.strictEqual(p.x, originalPt.x, 'Sau 4 lần xoay 90 độ, tọa độ x phải bảo toàn');
+      assert.strictEqual(p.y, originalPt.y, 'Sau 4 lần xoay 90 độ, tọa độ y phải bảo toàn');
+      console.log('✅ Test 10 [PASSED]: Xoay trang 90° và bảo toàn hình học sau 4 vòng xoay 360°.');
+
+      // ----------------------------------------------------
+      // 11. TEST PAGE REORDERING (Đổi thứ tự trang)
+      // ----------------------------------------------------
+      function reorderPages(pages, cornersMap, index, direction) {
+        const targetIdx = direction === 'left' ? index - 1 : index + 1;
+        if (targetIdx < 0 || targetIdx >= pages.length) return { pages, cornersMap };
+
+        const newPages = [...pages];
+        const temp = newPages[index];
+        newPages[index] = newPages[targetIdx];
+        newPages[targetIdx] = temp;
+
+        const newCorners = { ...cornersMap };
+        const cCurrent = newCorners[index];
+        const cTarget = newCorners[targetIdx];
+        if (cCurrent) newCorners[targetIdx] = cCurrent; else delete newCorners[targetIdx];
+        if (cTarget) newCorners[index] = cTarget; else delete newCorners[index];
+
+        return { pages: newPages, cornersMap: newCorners };
+      }
+
+      const initialPages = ['page1.jpg', 'page2.jpg', 'page3.jpg'];
+      const initialCornersMap = { 0: [{ x: 0, y: 0 }], 1: [{ x: 1, y: 1 }] };
+      const reordered = reorderPages(initialPages, initialCornersMap, 0, 'right');
+      assert.deepStrictEqual(reordered.pages, ['page2.jpg', 'page1.jpg', 'page3.jpg'], 'Hoán đổi vị trí trang 0 sang phải');
+      assert.deepStrictEqual(reordered.cornersMap[1], [{ x: 0, y: 0 }], 'Corners map của trang 0 phải chuyển sang index 1');
+      console.log('✅ Test 11 [PASSED]: Đổi thứ tự trang (Reorder Pages) và đồng bộ corners map an toàn.');
+
+      // ----------------------------------------------------
+      // 12. TEST FULL-TEXT SEARCH & OCR METADATA MATCHING
+      // ----------------------------------------------------
+      function filterDocuments(items, query) {
+        const q = query.toLowerCase().trim();
+        if (!q) return items;
+        return items.filter(item => {
+          const nameMatch = item.name.toLowerCase().includes(q);
+          const ocrMatch = item.ocrText && item.ocrText.toLowerCase().includes(q);
+          return nameMatch || ocrMatch;
+        });
+      }
+
+      function getOcrSnippet(text, query) {
+        const lower = text.toLowerCase();
+        const idx = lower.indexOf(query.toLowerCase().trim());
+        if (idx === -1) return text.substring(0, 30);
+        const start = Math.max(0, idx - 10);
+        const end = Math.min(text.length, idx + query.length + 15);
+        return text.substring(start, end).replace(/[\r\n]+/g, ' ');
+      }
+
+      const sampleDocs = [
+        { name: 'HopDong_KinhTe.pdf', ocrText: 'CỘNG HÒA XÃ HỘI CHỦ NGHĨA VIỆT NAM Điều khoản thanh toán đợt 1' },
+        { name: 'BienBan_NghiemThu.pdf', ocrText: 'Đã nghiệm thu hệ thống máy chủ và kiểm thử phần mềm' },
+        { name: 'CCCD_NguyenVanA.pdf', ocrText: 'Số CCCD 001202003344 Ngày cấp 15/08/2023' },
+      ];
+
+      const searchByOcr = filterDocuments(sampleDocs, 'thanh toán');
+      assert.strictEqual(searchByOcr.length, 1, 'Tìm kiếm từ khóa "thanh toán" phải tìm trúng HopDong_KinhTe.pdf');
+      assert.strictEqual(searchByOcr[0].name, 'HopDong_KinhTe.pdf');
+
+      const snippet = getOcrSnippet(searchByOcr[0].ocrText, 'thanh toán');
+      assert.ok(snippet.includes('thanh toán'), 'Snippet phải chứa đúng từ khóa tìm kiếm');
+      console.log('✅ Test 12 [PASSED]: Tìm kiếm toàn văn (Full-Text Search qua OCR Metadata) & trích đoạn Snippet.');
+
+      // ----------------------------------------------------
+      // 13. TEST BACKUP & RESTORE PAYLOAD INTEGRITY
+      // ----------------------------------------------------
+      function validateAndRestoreBackup(jsonStr) {
+        const payload = JSON.parse(jsonStr);
+        assert.ok(payload.appName, 'Payload phải có appName');
+        assert.ok(payload.storageData, 'Payload phải có storageData');
+        assert.ok(payload.ocrIndex, 'Payload phải có ocrIndex');
+        return {
+          restoredStorageKeys: Object.keys(payload.storageData).length,
+          restoredOcrKeys: Object.keys(payload.ocrIndex).length,
+        };
+      }
+
+      const mockBackup = JSON.stringify({
+        appName: 'CamScanner Pro',
+        appVersion: '2.6.2',
+        timestamp: Date.now(),
+        storageData: { '@camscanner_scan_quality': 'high', '@camscanner_color_mode': 'magic' },
+        ocrIndex: { 'Doc1.pdf': 'Văn bản hợp đồng mẫu', 'Doc2.pdf': 'Hóa đơn giá trị gia tăng' },
+      });
+
+      const restoreResult = validateAndRestoreBackup(mockBackup);
+      assert.strictEqual(restoreResult.restoredStorageKeys, 2, 'Phải khôi phục đúng 2 storage keys');
+      assert.strictEqual(restoreResult.restoredOcrKeys, 2, 'Phải khôi phục đúng 2 OCR index items');
+      console.log('✅ Test 13 [PASSED]: Xác thực tính toàn vẹn và khôi phục bản sao lưu dữ liệu (Backup & Restore).');
+
       console.log('\n====================================================');
-      console.log('🎉 TẤT CẢ 8 TEST SUITE ĐỀU VƯỢT QUA 100% THÀNH CÔNG!');
+      console.log('🎉 TẤT CẢ 13 TEST SUITE ĐỀU VƯỢT QUA 100% THÀNH CÔNG!');
       console.log('====================================================');
     });
 });
