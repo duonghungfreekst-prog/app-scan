@@ -1,4 +1,5 @@
-import React from 'react';
+import React, { Suspense, lazy } from 'react';
+import { View, ActivityIndicator } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
@@ -10,9 +11,32 @@ import HomeScreen from './src/screens/HomeScreen';
 import FilesScreen from './src/screens/FilesScreen';
 import ToolsScreen from './src/screens/ToolsScreen';
 import MeScreen from './src/screens/MeScreen';
-import ScannerScreen from './src/screens/ScannerScreen';
-import QRScannerScreen from './src/screens/QRScannerScreen';
-import QRGeneratorScreen from './src/screens/QRGeneratorScreen';
+
+// Lazy loading các màn hình chuyên sâu để cô lập JS bundle khởi động và ngăn chặn hoàn toàn lỗi crash startup
+const ScannerScreen = lazy(() => import('./src/screens/ScannerScreen'));
+const QRScannerScreen = lazy(() => import('./src/screens/QRScannerScreen'));
+const QRGeneratorScreen = lazy(() => import('./src/screens/QRGeneratorScreen'));
+
+function withSuspense(Component: React.ComponentType<any>) {
+  return function SuspenseWrapper(props: any) {
+    return (
+      <Suspense
+        fallback={
+          <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#0f172a' }}>
+            <ActivityIndicator size="large" color="#00e5cc" />
+          </View>
+        }
+      >
+        <Component {...props} />
+      </Suspense>
+    );
+  };
+}
+
+const LazyScanner = withSuspense(ScannerScreen);
+const LazyQRScanner = withSuspense(QRScannerScreen);
+const LazyQRGenerator = withSuspense(QRGeneratorScreen);
+
 import { ThemeProvider, useTheme } from './src/theme';
 import { MainTabParamList, RootStackParamList } from './src/types/navigation';
 
@@ -78,9 +102,9 @@ function AppInner() {
       <NavigationContainer linking={linking}>
         <Stack.Navigator screenOptions={{ headerShown: false }}>
           <Stack.Screen name="MainTabs" component={TabNavigator} />
-          <Stack.Screen name="Scanner" component={ScannerScreen} />
-          <Stack.Screen name="QRScanner" component={QRScannerScreen} />
-          <Stack.Screen name="QRGenerator" component={QRGeneratorScreen} />
+          <Stack.Screen name="Scanner" component={LazyScanner} />
+          <Stack.Screen name="QRScanner" component={LazyQRScanner} />
+          <Stack.Screen name="QRGenerator" component={LazyQRGenerator} />
         </Stack.Navigator>
       </NavigationContainer>
       <UpdateChecker />
