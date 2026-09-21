@@ -1,4 +1,17 @@
+import 'react-native-gesture-handler';
+import * as WebBrowser from 'expo-web-browser';
 import { registerRootComponent } from 'expo';
+
+// Deep link OAuth completion
+WebBrowser.maybeCompleteAuthSession();
+
+// Unhandled promise rejection listener để tránh đơ app trên Hermes
+(globalThis as any).onunhandledrejection = (event: any) => {
+  console.warn('[UNHANDLED PROMISE REJECTION]', event?.reason ?? event);
+  if (typeof event?.preventDefault === 'function') {
+    event.preventDefault();
+  }
+};
 
 const defaultHandler = (globalThis as any).ErrorUtils?.getGlobalHandler?.();
 (globalThis as any).ErrorUtils?.setGlobalHandler?.((error: any, isFatal: boolean) => {

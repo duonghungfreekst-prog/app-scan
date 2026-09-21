@@ -8,7 +8,12 @@
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.antigravity.camscanner",
+      "infoPlist": {
+        "NSPhotoLibraryUsageDescription": "Cho phép ứng dụng truy cập thư viện ảnh để nhập và lưu tài liệu scan.",
+        "NSPhotoLibraryAddUsageDescription": "Cho phép ứng dụng lưu ảnh và file PDF đã scan vào thư viện ảnh."
+      }
     },
     "android": {
       "versionCode": 6,
@@ -19,7 +24,7 @@
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
       "predictiveBackGestureEnabled": false,
-      "package": "com.camscanner.app"
+      "package": "com.antigravity.camscanner"
     },
     "web": {
       "favicon": "./assets/favicon.png"

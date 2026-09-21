@@ -1,7 +1,9 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { useColorScheme } from 'react-native';
 import Storage from './utils/storage';
+import { STORAGE_KEYS } from './constants/config';
 
-const DARK_MODE_KEY = '@camscanner_dark_mode';
+const DARK_MODE_KEY = STORAGE_KEYS.THEME_MODE;
 
 // ========= COLOR PALETTES =========
 export const LightTheme = {
@@ -22,7 +24,8 @@ export const LightTheme = {
   blue:         '#1e88e5',
   green:        '#43a047',
   shadow:       '#000000',
-  fabBg:        '#00bfa5',
+  fabBg:        '#00796b',
+  fabIcon:      '#ffffff',
   headerBg:     '#ffffff',
   headerText:   '#2c3e50',
   iconBg:       '#f5f6fa',
@@ -47,8 +50,9 @@ export const DarkTheme = {
   warn:         '#ff9800',
   blue:         '#64b5f6',
   green:        '#69f0ae',
-  shadow:       '#00e5cc',
-  fabBg:        '#00e5cc',
+  shadow:       '#000000',
+  fabBg:        '#00796b',
+  fabIcon:      '#ffffff',
   headerBg:     '#1a1a2e',
   headerText:   '#e0e0ff',
   iconBg:       '#16213e',
@@ -71,22 +75,57 @@ const ThemeContext = createContext<ThemeContextType>({
 });
 
 export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [isDark, setIsDark] = useState(false);
+  const systemColorScheme = useColorScheme();
+  const [hasUserPreference, setHasUserPreference] = useState(false);
+  const [isDark, setIsDark] = useState<boolean>(() => systemColorScheme === 'dark');
+  const userInteractedRef = useRef(false);
 
   useEffect(() => {
-    Storage.getItem(DARK_MODE_KEY).then((val: string | null) => {
-      if (val === 'true') setIsDark(true);
-    }).catch(() => {});
+    Storage.getItem(DARK_MODE_KEY)
+      .then(async (val: string | null) => {
+        if (userInteractedRef.current) return;
+        if (val !== null) {
+          setHasUserPreference(true);
+          setIsDark(val === 'true');
+        } else {
+          try {
+            const oldVal = await Storage.getItem('@camscanner_dark_mode');
+            if (oldVal !== null) {
+              setHasUserPreference(true);
+              setIsDark(oldVal === 'true');
+              await Storage.setItem(DARK_MODE_KEY, oldVal);
+            }
+          } catch {}
+        }
+      })
+      .catch(() => {});
   }, []);
 
-  const toggleDark = () => {
-    const next = !isDark;
-    setIsDark(next);
-    Storage.setItem(DARK_MODE_KEY, String(next)).catch(() => {});
-  };
+  useEffect(() => {
+    if (!hasUserPreference && !userInteractedRef.current) {
+      setIsDark(systemColorScheme === 'dark');
+    }
+  }, [systemColorScheme, hasUserPreference]);
+
+  const toggleDark = useCallback(() => {
+    userInteractedRef.current = true;
+    setHasUserPreference(true);
+    setIsDark(prev => {
+      const next = !prev;
+      Storage.setItem(DARK_MODE_KEY, String(next)).catch(() => {});
+      return next;
+    });
+  }, []);
+
+  const theme = useMemo(() => (isDark ? DarkTheme : LightTheme), [isDark]);
+
+  const value = useMemo(
+    () => ({ theme, isDark, toggleDark }),
+    [theme, isDark, toggleDark]
+  );
 
   return (
-    <ThemeContext.Provider value={{ theme: isDark ? DarkTheme : LightTheme, isDark, toggleDark }}>
+    <ThemeContext.Provider value={value}>
       {children}
     </ThemeContext.Provider>
   );

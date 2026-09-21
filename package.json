@@ -7,14 +7,12 @@
     "@react-navigation/bottom-tabs": "^7.18.8",
     "@react-navigation/native": "^7.3.8",
     "@react-navigation/native-stack": "^7.17.10",
-    "@types/qrcode": "^1.5.6",
     "docx": "^9.7.1",
     "expo": "~57.0.24",
     "expo-auth-session": "~57.0.12",
     "expo-camera": "~57.0.5",
     "expo-clipboard": "~57.0.2",
     "expo-constants": "~57.0.19",
-    "expo-crypto": "~57.0.3",
     "expo-document-picker": "~57.0.2",
     "expo-file-system": "~57.0.7",
     "expo-font": "~57.0.4",
@@ -22,7 +20,7 @@
     "expo-image-picker": "~57.0.19",
     "expo-linear-gradient": "~57.0.2",
     "expo-print": "~57.0.2",
-    "expo-secure-store": "^57.0.4",
+    "expo-secure-store": "~57.0.4",
     "expo-sharing": "~57.0.21",
     "expo-status-bar": "~57.0.1",
     "expo-web-browser": "~57.0.3",
@@ -32,15 +30,19 @@
     "react": "19.2.3",
     "react-native": "0.86.3",
     "react-native-document-scanner-plugin": "^2.0.4",
+    "react-native-gesture-handler": "~2.32.0",
     "react-native-safe-area-context": "~5.7.0",
     "react-native-screens": "~4.26.0",
-    "xlsx": "^0.18.5"
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   },
   "devDependencies": {
-    "@react-native-community/cli": "^18.0.0",
+    "@types/qrcode": "^1.5.6",
     "@types/react": "~19.2.2",
     "babel-preset-expo": "^57.0.6",
     "typescript": "~6.0.3"
+  },
+  "overrides": {
+    "jszip": "^3.10.2"
   },
   "scripts": {
     "start": "expo start",

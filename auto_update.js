@@ -38,13 +38,26 @@ const appJsonPath = './app.json';
 const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
 const appJson = JSON.parse(fs.readFileSync(appJsonPath, 'utf8'));
 
-const currentVer = pkg.version || '2.6.0';
-const parts = currentVer.split('.').map(Number);
-parts[parts.length - 1] = (parts[parts.length - 1] || 0) + 1;
-const newVersion = parts.join('.');
+// Kiểm tra tính hợp lệ của version trong package.json
+const currentVer = pkg.version;
+if (!currentVer || typeof currentVer !== 'string' || !/^\d+\.\d+\.\d+$/.test(currentVer.trim())) {
+  console.error(`\n❌ LỖI: version trong package.json không hợp lệ: "${currentVer}". Yêu cầu định dạng SemVer x.y.z (ví dụ: 2.6.0).`);
+  process.exit(1);
+}
 
+// Kiểm tra tính hợp lệ của versionCode trong app.json
+if (!appJson.expo) appJson.expo = {};
 if (!appJson.expo.android) appJson.expo.android = {};
-const oldCode = appJson.expo.android.versionCode || 1;
+const oldCode = appJson.expo.android.versionCode;
+if (oldCode === undefined || typeof oldCode !== 'number' || !Number.isInteger(oldCode) || oldCode < 1) {
+  console.error(`\n❌ LỖI: android.versionCode trong app.json không hợp lệ: ${oldCode}. Yêu cầu số nguyên dương (>= 1).`);
+  process.exit(1);
+}
+
+const cleanVer = currentVer.trim();
+const parts = cleanVer.split('.').map(Number);
+parts[parts.length - 1] += 1;
+const newVersion = parts.join('.');
 const newCode = oldCode + 1;
 
 pkg.version = newVersion;
@@ -55,11 +68,16 @@ fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
 fs.writeFileSync(appJsonPath, JSON.stringify(appJson, null, 2) + '\n');
 
 // Tự động đồng bộ package-lock.json
+console.log(' -> Đang đồng bộ package-lock.json...');
 try {
-  execSync('npm install --package-lock-only', { stdio: 'ignore' });
-} catch (e) {}
+  execSync('npm install --package-lock-only', { stdio: 'pipe' });
+  console.log('✅ Đã đồng bộ package-lock.json thành công.');
+} catch (e) {
+  const errMsg = e.stderr ? e.stderr.toString().trim() : e.message;
+  console.warn(`⚠️ CẢNH BÁO: Đồng bộ package-lock.json thất bại: ${errMsg}`);
+}
 
-console.log(` -> Phiên bản nâng cấp: v${currentVer} -> v${newVersion}`);
+console.log(` -> Phiên bản nâng cấp: v${cleanVer} -> v${newVersion}`);
 console.log(` -> Android Build Code: ${oldCode} -> ${newCode}`);
 
 // 3. Git Commit & Tag

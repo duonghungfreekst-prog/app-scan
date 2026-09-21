@@ -12,10 +12,66 @@ export const STORAGE_KEYS = {
   CAM_PERM: '@camscanner_cam_perm',
   DRAFT_SCAN_SESSION: '@camscanner_draft_session_v1',
   APP_THEME: '@camscanner_theme_mode',
+  THEME_MODE: '@camscanner_theme_mode',
   GOOGLE_CLIENT_ID_ANDROID: '@camscanner_google_client_id_android',
   GOOGLE_CLIENT_ID_WEB: '@camscanner_google_client_id_web',
   OCR_METADATA_INDEX: '@camscanner_ocr_metadata_index_v1',
 } as const;
+
+// Giới hạn & Timeouts hệ thống
+export const MAX_UPLOAD_SIZE_MB = 50;
+export const PDF_PROCESS_TIMEOUT_MS = 60000;
+export const AI_TIMEOUT_MS = 30000;
+
+// Cấu hình thử lại chuẩn (Retry Policy)
+export const RETRY_CONFIG = {
+  MAX_RETRIES: 3,
+  INITIAL_DELAY_MS: 500,
+  MAX_DELAY_MS: 5000,
+  BACKOFF_FACTOR: 2,
+  JITTER: true,
+  RETRYABLE_STATUS_CODES: [408, 429, 500, 502, 503, 504],
+} as const;
+
+// Bảng mã lỗi chuẩn hệ thống (Standard Error Codes)
+export const ERROR_CODES = {
+  // Lỗi mạng & Kết nối
+  NETWORK_ERROR: 'NETWORK_ERROR',
+  TIMEOUT: 'TIMEOUT',
+  SERVER_ERROR: 'SERVER_ERROR',
+
+  // Xác thực & Quota
+  UNAUTHORIZED: 'UNAUTHORIZED',
+  INVALID_API_KEY: 'INVALID_API_KEY',
+  QUOTA_EXCEEDED: 'QUOTA_EXCEEDED',
+
+  // Quyền truy cập thiết bị
+  PERMISSION_DENIED: 'PERMISSION_DENIED',
+  CAMERA_PERMISSION_DENIED: 'CAMERA_PERMISSION_DENIED',
+  STORAGE_PERMISSION_DENIED: 'STORAGE_PERMISSION_DENIED',
+
+  // Tệp tin & Dữ liệu
+  FILE_NOT_FOUND: 'FILE_NOT_FOUND',
+  FILE_TOO_LARGE: 'FILE_TOO_LARGE',
+  FILE_CORRUPTED: 'FILE_CORRUPTED',
+  INVALID_FILE_TYPE: 'INVALID_FILE_TYPE',
+
+  // Xử lý ảnh & OCR & AI
+  IMAGE_PROCESSING_FAILED: 'IMAGE_PROCESSING_FAILED',
+  OCR_FAILED: 'OCR_FAILED',
+  AI_PROCESSING_ERROR: 'AI_PROCESSING_ERROR',
+
+  // Xử lý PDF
+  PDF_PROCESS_FAILED: 'PDF_PROCESS_FAILED',
+  PDF_PASSWORD_REQUIRED: 'PDF_PASSWORD_REQUIRED',
+  PDF_TOO_LARGE: 'PDF_TOO_LARGE',
+
+  // Hoạt động & Hệ thống chung
+  CANCELLED: 'CANCELLED',
+  UNKNOWN_ERROR: 'UNKNOWN_ERROR',
+} as const;
+
+export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
 
 // Endpoints & Models
 export const AI_CONFIG = {
@@ -49,19 +105,36 @@ export const IMAGE_PROCESSING_CONFIG = {
 
   // Độ tương phản và binarization
   DEFAULT_CONTRAST: 1.45,
-  MAGIC_CONTRAST_POWER: 2.8, // Làm dốc đường cong mà không phá vỡ nét chữ chì/mảnh
+  CONTRAST_MIN: 0.6,
+  CONTRAST_MAX: 2.2,
+  MAGIC_CONTRAST_POWER: 2.6, // Chuẩn hóa về 2.6 cho soft-gamma
   MAGIC_WHITE_THRESHOLD: 195,
-  BW_LOCAL_THRESHOLD_OFFSET: 15, // Dùng ngưỡng tương đối so với nền cục bộ
+  MAGIC_INK_CEILING: 215,
+  GRAYSCALE_WHITE_THRESHOLD: 220,
+  SHADOW_EDGE_THRESHOLD: 190,
+  BW_THRESHOLD_BASE_RATIO: 0.76,
+  BW_LOCAL_THRESHOLD_OFFSET: 15,
   
   // Phát hiện con dấu & chữ ký
   STAMP_RED_MIN: 90,
   STAMP_RED_DOMINANCE: 35,
   INK_BLUE_MIN: 80,
   INK_BLUE_DOMINANCE: 25,
+  COLOR_BOOST: {
+    STAMP_RED_FACTOR: 1.4,
+    STAMP_RED_SUPPRESS: 0.4,
+    INK_BLUE_FACTOR: 1.4,
+    INK_BLUE_RED_SUPPRESS: 0.4,
+    INK_BLUE_GREEN_SUPPRESS: 0.5,
+  },
+
+  // Làm nét (Unsharp Mask)
+  UNSHARP_MASK_AMOUNT: 0.55,
 
   // Book Dewarp
   BOOK_DEWARP_MIN_GRADIENT: 4.0, // Ngưỡng tối thiểu để xác nhận có gáy sách cong
   BOOK_DEWARP_MAX_SHIFT_RATIO: 0.06,
+  BOOK_DEWARP_GRADIENT_DIVISOR: 200,
 
   // Chất lượng xuất bản
   QUALITY: {

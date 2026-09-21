@@ -12,9 +12,10 @@ import {
   Dimensions,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Clipboard from 'expo-clipboard';
 import * as FileSystem from 'expo-file-system/legacy';
-import { getDocumentDirectory } from '../utils/fileHelper';
+import { getDocumentDirectory, saveBase64ToDocuments } from '../utils/fileHelper';
 import * as Sharing from 'expo-sharing';
 import * as DocumentPicker from 'expo-document-picker';
 import Storage from '../utils/storage';
@@ -74,6 +75,126 @@ function uint8ToBase64(bytes: Uint8Array): string {
   return base64;
 }
 
+// CRC32 table & helper for pure JS PNG chunk generation
+const CRC_TABLE = new Uint32Array(256);
+for (let i = 0; i < 256; i++) {
+  let c = i;
+  for (let k = 0; k < 8; k++) {
+    c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+  }
+  CRC_TABLE[i] = c;
+}
+
+function crc32(buf: Uint8Array): number {
+  let crc = 0 ^ (-1);
+  for (let i = 0; i < buf.length; i++) {
+    crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ buf[i]) & 0xff];
+  }
+  return (crc ^ (-1)) >>> 0;
+}
+
+function createPngChunk(type: string, data: Uint8Array): Uint8Array {
+  const len = data.length;
+  const chunk = new Uint8Array(4 + 4 + len + 4);
+  const view = new DataView(chunk.buffer);
+  view.setUint32(0, len);
+  for (let i = 0; i < 4; i++) {
+    chunk[4 + i] = type.charCodeAt(i);
+  }
+  chunk.set(data, 8);
+  const crcData = chunk.subarray(4, 8 + len);
+  view.setUint32(8 + len, crc32(crcData));
+  return chunk;
+}
+
+// Pure JS PNG QR Code Generator (Hỗ trợ tùy chọn độ phân giải cao scale 10 HD)
+function generatePngQrUrl(
+  text: string,
+  fgHex: string = '#000000',
+  bgHex: string = '#ffffff',
+  ecc: 'L' | 'M' | 'Q' | 'H' = 'M',
+  scale: number = 10,
+  margin: number = 4
+): string {
+  const QRCode = require('qrcode');
+  const pako = require('pako');
+
+  let qr: any;
+  const eccFallbackOrder: Array<'H' | 'Q' | 'M' | 'L'> =
+    ecc === 'H' ? ['H', 'Q', 'M', 'L'] : ecc === 'Q' ? ['Q', 'M', 'L'] : [ecc];
+
+  let lastErr: any = null;
+  for (const level of eccFallbackOrder) {
+    try {
+      qr = QRCode.create(text, { errorCorrectionLevel: level });
+      break;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+
+  if (!qr) {
+    throw new Error(lastErr?.message || 'The amount of data is too big to be stored in a QR code');
+  }
+
+  const size = qr.modules.size;
+  const data = qr.modules.data;
+  const fullSize = size + margin * 2;
+  const width = fullSize * scale;
+  const height = width;
+
+  const [fgR, fgG, fgB] = hexToRgb(fgHex);
+  const [bgR, bgG, bgB] = hexToRgb(bgHex);
+
+  const rawRowLen = 1 + width * 3; // 1 byte filter (0: None) + 3 bytes RGB
+  const rawData = new Uint8Array(rawRowLen * height);
+
+  for (let y = 0; y < height; y++) {
+    const rowOffset = y * rawRowLen;
+    rawData[rowOffset] = 0; // Filter: None
+    const qrY = Math.floor(y / scale) - margin;
+    for (let x = 0; x < width; x++) {
+      const qrX = Math.floor(x / scale) - margin;
+      let isDark = false;
+      if (qrY >= 0 && qrY < size && qrX >= 0 && qrX < size) {
+        isDark = Boolean(data[qrY * size + qrX]);
+      }
+      const px = rowOffset + 1 + x * 3;
+      rawData[px] = isDark ? fgR : bgR;
+      rawData[px + 1] = isDark ? fgG : bgG;
+      rawData[px + 2] = isDark ? fgB : bgB;
+    }
+  }
+
+  const compressed = pako.deflate(rawData);
+
+  const ihdr = new Uint8Array(13);
+  const ihdrView = new DataView(ihdr.buffer);
+  ihdrView.setUint32(0, width);
+  ihdrView.setUint32(4, height);
+  ihdr[8] = 8; // Bit depth: 8
+  ihdr[9] = 2; // Color type: RGB
+  ihdr[10] = 0; // Compression: deflate
+  ihdr[11] = 0; // Filter: standard
+  ihdr[12] = 0; // Interlace: none
+
+  const ihdrChunk = createPngChunk('IHDR', ihdr);
+  const idatChunk = createPngChunk('IDAT', compressed);
+  const iendChunk = createPngChunk('IEND', new Uint8Array(0));
+
+  const sig = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const totalLen = sig.length + ihdrChunk.length + idatChunk.length + iendChunk.length;
+  const pngBuf = new Uint8Array(totalLen);
+
+  let off = 0;
+  pngBuf.set(sig, off); off += sig.length;
+  pngBuf.set(ihdrChunk, off); off += ihdrChunk.length;
+  pngBuf.set(idatChunk, off); off += idatChunk.length;
+  pngBuf.set(iendChunk, off); off += iendChunk.length;
+
+  return 'data:image/png;base64,' + uint8ToBase64(pngBuf);
+}
+
 // Pure JS BMP QR Code Generator (Zero native dependencies, 100% reliable)
 function generateBmpQrUrl(
   text: string,
@@ -100,7 +221,7 @@ function generateBmpQrUrl(
   }
 
   if (!qr) {
-    throw new Error(lastErr?.message || 'Dữ liệu quá dài vượt quá dung lượng tối đa của mã QR.');
+    throw new Error(lastErr?.message || 'The amount of data is too big to be stored in a QR code');
   }
 
   const size = qr.modules.size;
@@ -164,13 +285,49 @@ function generateBmpQrUrl(
   return 'data:image/bmp;base64,' + uint8ToBase64(buf);
 }
 
+// Helper hàm tạo mã QR chung hỗ trợ tùy chọn định dạng và scale
+function generateQrUrl(
+  text: string,
+  fgHex: string = '#000000',
+  bgHex: string = '#ffffff',
+  ecc: 'L' | 'M' | 'Q' | 'H' = 'M',
+  format: 'png' | 'bmp' = 'png',
+  scale: number = 10,
+  margin: number = 4
+): string {
+  if (format === 'bmp') {
+    return generateBmpQrUrl(text, fgHex, bgHex, ecc, scale, margin);
+  }
+  return generatePngQrUrl(text, fgHex, bgHex, ecc, scale, margin);
+}
+
+// Helper phân tích và sinh thông báo lỗi thân thiện khi dữ liệu quá dài
+function getFriendlyQrErrorMessage(err: any, textLength: number): string {
+  const msg = (err?.message || err?.toString() || '').toLowerCase();
+  if (
+    msg.includes('too big') ||
+    msg.includes('amount of data') ||
+    msg.includes('overflow') ||
+    msg.includes('capacity') ||
+    msg.includes('maximum size') ||
+    textLength > 2000
+  ) {
+    return `Nội dung quá dài (${textLength.toLocaleString()} ký tự), vượt quá dung lượng lưu trữ tối đa của chuẩn mã QR. Vui lòng rút ngắn văn bản hoặc chuyển mức sửa lỗi sang "Thấp (L)".`;
+  }
+  return err?.message || 'Không thể tạo mã QR từ dữ liệu đã nhập.';
+}
+
 export default function QRGeneratorScreen({ navigation }: any) {
   const { theme } = useTheme();
+  const insets = useSafeAreaInsets();
 
   const [inputText, setInputText] = useState('WIFI:S:MyNetwork;T:WPA;P:MyPassword;;');
   const [selectedColor, setSelectedColor] = useState(COLOR_PRESETS[0]);
   const [ecc, setEcc] = useState<'L' | 'M' | 'Q' | 'H'>('M');
+  const [qrScale, setQrScale] = useState<number>(10); // Tùy chọn độ phân giải: scale 10 (HD siêu nét) hoặc scale 6
+  const [exportFormat, setExportFormat] = useState<'png' | 'bmp'>('png');
   const [qrDataUrl, setQrDataUrl] = useState<string>('');
+  const [qrError, setQrError] = useState<string | null>(null);
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [activeTab, setActiveTab] = useState<'generator' | 'history'>('generator');
@@ -180,18 +337,19 @@ export default function QRGeneratorScreen({ navigation }: any) {
     loadHistory();
   }, []);
 
-  // Generate QR whenever text, color, or ecc changes
+  // Generate QR whenever text, color, ecc, format, or scale changes
   useEffect(() => {
     const timer = setTimeout(() => {
       if (inputText.trim().length > 0) {
         handleCreateQR(inputText.trim(), false);
       } else {
         setQrDataUrl('');
+        setQrError(null);
       }
     }, 300);
 
     return () => clearTimeout(timer);
-  }, [inputText, selectedColor, ecc]);
+  }, [inputText, selectedColor, ecc, exportFormat, qrScale]);
 
   const loadHistory = async () => {
     try {
@@ -245,11 +403,12 @@ export default function QRGeneratorScreen({ navigation }: any) {
     ]);
   };
 
-  const handleCreateQR = (textToEncode: string, showAlertOnEmpty: boolean = true) => {
+  const handleCreateQR = (textToEncode: string, showAlertOnError: boolean = false) => {
     const trimmed = textToEncode.trim();
     if (!trimmed) {
       setQrDataUrl('');
-      if (showAlertOnEmpty) {
+      setQrError(null);
+      if (showAlertOnError) {
         Alert.alert('Thông báo', 'Vui lòng nhập văn bản hoặc chọn file Excel trước khi tạo mã QR.');
       }
       return;
@@ -257,12 +416,29 @@ export default function QRGeneratorScreen({ navigation }: any) {
 
     setIsGenerating(true);
     try {
-      const url = generateBmpQrUrl(trimmed, selectedColor.fg, selectedColor.bg, ecc);
+      const url = generateQrUrl(
+        trimmed,
+        selectedColor.fg,
+        selectedColor.bg,
+        ecc,
+        exportFormat,
+        qrScale,
+        exportFormat === 'bmp' ? 2 : 4
+      );
       setQrDataUrl(url);
+      setQrError(null);
       saveToHistory(trimmed, url);
     } catch (err: any) {
       console.log('QR generation failed', err);
-      Alert.alert('Không thể tạo QR', err?.message || 'Dữ liệu quá dài hoặc không hợp lệ để tạo mã QR.');
+      const friendlyMsg = getFriendlyQrErrorMessage(err, trimmed.length);
+      setQrDataUrl('');
+      setQrError(friendlyMsg);
+      if (showAlertOnError) {
+        Alert.alert(
+          '⚠️ Nội dung quá dài',
+          `${friendlyMsg}\n\n💡 Gợi ý khắc phục:\n• Rút ngắn độ dài nội dung văn bản.\n• Chuyển mức sửa lỗi sang "Thấp (L)" để có dung lượng chứa tối đa.\n• Sử dụng link rút gọn nếu là đường dẫn web.`
+        );
+      }
     } finally {
       setIsGenerating(false);
     }
@@ -314,12 +490,12 @@ export default function QRGeneratorScreen({ navigation }: any) {
 
         if (csvText && csvText.trim()) {
           let textToUse = csvText.trim();
-          if (textToUse.length > 2500) {
+          if (textToUse.length > 2200) {
             Alert.alert(
               '⚠️ Cảnh báo dung lượng',
-              `Dữ liệu file Excel (${file.name}) khá lớn. Ứng dụng đã trích xuất 2,500 ký tự đầu tiên để đảm bảo mã QR dễ quét.`
+              `Dữ liệu file Excel (${file.name}) khá lớn (${textToUse.length} ký tự). Ứng dụng đã trích xuất 2,200 ký tự đầu tiên để đảm bảo mã QR dễ quét và không bị tràn dung lượng.`
             );
-            textToUse = textToUse.substring(0, 2500);
+            textToUse = textToUse.substring(0, 2200);
           } else {
             Alert.alert('✅ Đã trích xuất', `Đã nhập dữ liệu thành công từ file "${file.name}" (Sheet: ${firstSheetName}).`);
           }
@@ -334,39 +510,86 @@ export default function QRGeneratorScreen({ navigation }: any) {
     }
   };
 
-  const handleSaveImage = async () => {
-    if (!qrDataUrl) {
+  // Tạo ảnh PNG HD (Scale 10) chuẩn xác
+  const getHighResPngDataUrl = (scale: number = 10): string => {
+    const trimmed = inputText.trim();
+    if (!trimmed) {
+      throw new Error('Nội dung văn bản trống.');
+    }
+    return generatePngQrUrl(trimmed, selectedColor.fg, selectedColor.bg, ecc, scale, 4);
+  };
+
+  // Lưu ảnh vào documents/
+  const handleSaveToDocuments = async (highRes: boolean = true) => {
+    if (!inputText.trim()) {
       Alert.alert('Chưa có mã QR', 'Vui lòng nhập văn bản để tạo mã QR trước.');
       return;
     }
 
     try {
-      const base64Data = qrDataUrl.includes('base64,')
-        ? qrDataUrl.split('base64,')[1]
-        : qrDataUrl;
+      const scaleToUse = highRes ? 10 : qrScale;
+      // Nếu yêu cầu highRes hoặc đang ở định dạng PNG thì tạo PNG với scale tương ứng
+      const dataUrl = highRes ? getHighResPngDataUrl(10) : qrDataUrl || getHighResPngDataUrl(qrScale);
+      const base64Data = dataUrl.includes('base64,') ? dataUrl.split('base64,')[1] : dataUrl;
+      const isBmp = dataUrl.startsWith('data:image/bmp');
+      const ext = isBmp ? '.bmp' : '.png';
+      const fileName = `QR_${highRes ? 'HD_' : ''}${Date.now()}${ext}`;
 
-      const isBmp = qrDataUrl.startsWith('data:image/bmp');
-      const ext = isBmp ? 'bmp' : 'png';
-      const mime = isBmp ? 'image/bmp' : 'image/png';
-      const filename = `QR_${Date.now()}.${ext}`;
-      const docDir = getDocumentDirectory();
-      const fileUri = `${docDir}${filename}`;
+      const savedUri = await saveBase64ToDocuments(base64Data, fileName);
+      const cleanFileName = savedUri.split('/').pop() || fileName;
 
-      await FileSystem.writeAsStringAsync(fileUri, base64Data, {
-        encoding: FileSystem.EncodingType.Base64,
-      });
+      Alert.alert(
+        '✅ Đã lưu vào Documents',
+        `Đã lưu ảnh mã QR PNG độ phân giải cao (Scale ${scaleToUse}) thành công vào thư mục Documents của ứng dụng:\n${cleanFileName}\n\nBạn có muốn chia sẻ ảnh này ngay không?`,
+        [
+          { text: 'Xong', style: 'cancel' },
+          {
+            text: 'Chia sẻ ngay',
+            onPress: async () => {
+              if (await Sharing.isAvailableAsync()) {
+                await Sharing.shareAsync(savedUri, {
+                  dialogTitle: `Chia sẻ Mã QR PNG HD (Scale ${scaleToUse})`,
+                  mimeType: isBmp ? 'image/bmp' : 'image/png',
+                });
+              }
+            },
+          },
+        ]
+      );
+    } catch (e: any) {
+      console.log('Save to documents error', e);
+      Alert.alert('Lỗi', `Không thể lưu hình ảnh vào Documents: ${e?.message || 'Có lỗi xảy ra'}`);
+    }
+  };
+
+  // Chia sẻ ảnh mã QR (mặc định xuất PNG độ phân giải cao scale 10)
+  const handleShareQr = async (highRes: boolean = true) => {
+    if (!inputText.trim()) {
+      Alert.alert('Chưa có mã QR', 'Vui lòng nhập văn bản để tạo mã QR trước.');
+      return;
+    }
+
+    try {
+      const scaleToUse = highRes ? 10 : qrScale;
+      const dataUrl = highRes ? getHighResPngDataUrl(10) : qrDataUrl || getHighResPngDataUrl(qrScale);
+      const base64Data = dataUrl.includes('base64,') ? dataUrl.split('base64,')[1] : dataUrl;
+      const isBmp = dataUrl.startsWith('data:image/bmp');
+      const ext = isBmp ? '.bmp' : '.png';
+      const fileName = `QR_${highRes ? 'HD_' : ''}${Date.now()}${ext}`;
+
+      const savedUri = await saveBase64ToDocuments(base64Data, fileName);
 
       if (await Sharing.isAvailableAsync()) {
-        await Sharing.shareAsync(fileUri, {
-          dialogTitle: 'Lưu hoặc Chia sẻ Mã QR',
-          mimeType: mime,
+        await Sharing.shareAsync(savedUri, {
+          dialogTitle: `Chia sẻ Mã QR PNG HD (Scale ${scaleToUse})`,
+          mimeType: isBmp ? 'image/bmp' : 'image/png',
         });
       } else {
-        Alert.alert('✅ Thành công', `Đã lưu ảnh mã QR vào thiết bị:\n${filename}`);
+        Alert.alert('✅ Thành công', `Đã lưu ảnh mã QR vào thư mục Documents:\n${fileName}`);
       }
     } catch (e: any) {
-      console.log('Save QR image error', e);
-      Alert.alert('Lỗi', `Không thể lưu/chia sẻ hình ảnh mã QR: ${e?.message || 'Có lỗi xảy ra'}`);
+      console.log('Share QR error', e);
+      Alert.alert('Lỗi', `Không thể chia sẻ mã QR: ${e?.message || 'Có lỗi xảy ra'}`);
     }
   };
 
@@ -392,8 +615,17 @@ export default function QRGeneratorScreen({ navigation }: any) {
 
   return (
     <View style={[styles.container, { backgroundColor: theme.bg }]}>
-      {/* Header */}
-      <View style={[styles.header, { backgroundColor: theme.headerBg, borderBottomColor: theme.border }]}>
+      {/* Header - Áp dụng useSafeAreaInsets() bỏ paddingTop cứng */}
+      <View
+        style={[
+          styles.header,
+          {
+            backgroundColor: theme.headerBg,
+            borderBottomColor: theme.border,
+            paddingTop: Math.max(insets.top, 16) + 8,
+          },
+        ]}
+      >
         <TouchableOpacity style={styles.backBtn} onPress={() => navigation.goBack()}>
           <Ionicons name="arrow-back" size={24} color={theme.headerText} />
         </TouchableOpacity>
@@ -436,7 +668,7 @@ export default function QRGeneratorScreen({ navigation }: any) {
           <Text
             style={[
               styles.tabText,
-            { color: activeTab === 'history' ? theme.accent : theme.textMuted },
+              { color: activeTab === 'history' ? theme.accent : theme.textMuted },
             ]}
           >
             Lịch sử ({history.length})
@@ -445,7 +677,13 @@ export default function QRGeneratorScreen({ navigation }: any) {
       </View>
 
       {activeTab === 'generator' ? (
-        <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
+        <ScrollView
+          contentContainerStyle={[
+            styles.content,
+            { paddingBottom: Math.max(insets.bottom, 16) + 24 },
+          ]}
+          keyboardShouldPersistTaps="handled"
+        >
           {/* Input Section */}
           <View style={[styles.card, { backgroundColor: theme.card, borderColor: theme.border }]}>
             <View style={styles.cardHeader}>
@@ -467,7 +705,7 @@ export default function QRGeneratorScreen({ navigation }: any) {
                 styles.textInput,
                 {
                   backgroundColor: theme.surface,
-                  borderColor: theme.border,
+                  borderColor: qrError ? theme.danger : theme.border,
                   color: theme.text,
                 },
               ]}
@@ -481,12 +719,54 @@ export default function QRGeneratorScreen({ navigation }: any) {
 
             {inputText.length > 0 && (
               <View style={styles.inputFooter}>
-                <Text style={[styles.charCount, { color: theme.textMuted }]}>
-                  {inputText.length} ký tự
+                <Text
+                  style={[
+                    styles.charCount,
+                    {
+                      color:
+                        inputText.length > 2200
+                          ? theme.danger
+                          : inputText.length > 1500
+                          ? '#ea580c'
+                          : theme.textMuted,
+                      fontWeight: inputText.length > 1500 ? '600' : '400',
+                    },
+                  ]}
+                >
+                  {inputText.length} ký tự {inputText.length > 2000 ? '(Khá dài - có thể khó quét)' : ''}
                 </Text>
                 <TouchableOpacity onPress={() => setInputText('')}>
                   <Text style={{ color: theme.danger, fontSize: 13, fontWeight: '600' }}>Xóa hết</Text>
                 </TouchableOpacity>
+              </View>
+            )}
+
+            {/* Cảnh báo thân thiện khi chuỗi quá dài gây lỗi */}
+            {qrError && (
+              <View style={[styles.errorBanner, { backgroundColor: '#fef2f2', borderColor: '#fca5a5' }]}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 4 }}>
+                  <Ionicons name="warning" size={18} color="#dc2626" />
+                  <Text style={styles.errorBannerTitle}> Giới hạn dung lượng mã QR</Text>
+                </View>
+                <Text style={styles.errorBannerText}>{qrError}</Text>
+                <View style={styles.errorBannerActions}>
+                  {ecc !== 'L' && (
+                    <TouchableOpacity
+                      style={[styles.errorActionChip, { backgroundColor: '#fee2e2' }]}
+                      onPress={() => setEcc('L')}
+                    >
+                      <Text style={styles.errorActionChipText}>⚡ Chuyển sang mức Thấp (L)</Text>
+                    </TouchableOpacity>
+                  )}
+                  {inputText.length > 2000 && (
+                    <TouchableOpacity
+                      style={[styles.errorActionChip, { backgroundColor: '#fee2e2' }]}
+                      onPress={() => setInputText((prev) => prev.substring(0, 2000))}
+                    >
+                      <Text style={styles.errorActionChipText}>✂️ Tự động cắt về 2,000 ký tự</Text>
+                    </TouchableOpacity>
+                  )}
+                </View>
               </View>
             )}
 
@@ -593,6 +873,92 @@ export default function QRGeneratorScreen({ navigation }: any) {
                 );
               })}
             </View>
+
+            {/* Tùy chọn Độ phân giải & Định dạng xuất ảnh (Hỗ trợ PNG Scale 10 HD) */}
+            <Text style={[styles.subLabel, { color: theme.textSub, marginTop: 14 }]}>
+              Độ phân giải & Định dạng xuất ảnh:
+            </Text>
+            <View style={styles.formatRow}>
+              <TouchableOpacity
+                style={[
+                  styles.formatChip,
+                  exportFormat === 'png' && qrScale === 10
+                    ? { backgroundColor: theme.accent, borderColor: theme.accent }
+                    : { backgroundColor: theme.surface, borderColor: theme.border },
+                ]}
+                onPress={() => {
+                  setExportFormat('png');
+                  setQrScale(10);
+                }}
+              >
+                <Ionicons
+                  name="sparkles"
+                  size={14}
+                  color={exportFormat === 'png' && qrScale === 10 ? '#ffffff' : theme.accent}
+                />
+                <Text
+                  style={[
+                    styles.formatChipText,
+                    {
+                      color: exportFormat === 'png' && qrScale === 10 ? '#ffffff' : theme.text,
+                      fontWeight: exportFormat === 'png' && qrScale === 10 ? '700' : '500',
+                    },
+                  ]}
+                >
+                  {' '}PNG HD (Scale 10)
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[
+                  styles.formatChip,
+                  exportFormat === 'png' && qrScale === 6
+                    ? { backgroundColor: theme.accent, borderColor: theme.accent }
+                    : { backgroundColor: theme.surface, borderColor: theme.border },
+                ]}
+                onPress={() => {
+                  setExportFormat('png');
+                  setQrScale(6);
+                }}
+              >
+                <Text
+                  style={[
+                    styles.formatChipText,
+                    {
+                      color: exportFormat === 'png' && qrScale === 6 ? '#ffffff' : theme.text,
+                      fontWeight: exportFormat === 'png' && qrScale === 6 ? '700' : '500',
+                    },
+                  ]}
+                >
+                  PNG Chuẩn (Scale 6)
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[
+                  styles.formatChip,
+                  exportFormat === 'bmp'
+                    ? { backgroundColor: theme.accent, borderColor: theme.accent }
+                    : { backgroundColor: theme.surface, borderColor: theme.border },
+                ]}
+                onPress={() => {
+                  setExportFormat('bmp');
+                  setQrScale(6);
+                }}
+              >
+                <Text
+                  style={[
+                    styles.formatChipText,
+                    {
+                      color: exportFormat === 'bmp' ? '#ffffff' : theme.text,
+                      fontWeight: exportFormat === 'bmp' ? '700' : '500',
+                    },
+                  ]}
+                >
+                  BMP (Scale 6)
+                </Text>
+              </TouchableOpacity>
+            </View>
           </View>
 
           {/* QR Code Output Display Card */}
@@ -604,20 +970,46 @@ export default function QRGeneratorScreen({ navigation }: any) {
                 <ActivityIndicator size="large" color={theme.accent} />
                 <Text style={[styles.placeholderText, { color: theme.textMuted }]}>Đang tạo mã QR...</Text>
               </View>
+            ) : qrError ? (
+              <View style={styles.qrPlaceholder}>
+                <Ionicons name="alert-circle-outline" size={56} color={theme.danger} />
+                <Text style={[styles.placeholderTitle, { color: theme.danger, marginTop: 8 }]}>
+                  Dữ liệu quá dài
+                </Text>
+                <Text style={[styles.placeholderText, { color: theme.textMuted, maxWidth: 300 }]}>
+                  {qrError}
+                </Text>
+              </View>
             ) : qrDataUrl ? (
               <View style={styles.qrContainer}>
                 <View style={[styles.qrWrapper, { backgroundColor: selectedColor.bg }]}>
                   <Image source={{ uri: qrDataUrl }} style={styles.qrImage} resizeMode="contain" />
                 </View>
 
-                {/* Actions */}
+                {/* Badge thông tin độ phân giải */}
+                <View style={[styles.resBadge, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+                  <Ionicons name="checkmark-circle" size={14} color={theme.green} />
+                  <Text style={[styles.resBadgeText, { color: theme.textSub }]}>
+                    {' '}Định dạng: {exportFormat.toUpperCase()} • Độ nét: Scale {qrScale} {qrScale === 10 ? '(HD Siêu nét)' : ''}
+                  </Text>
+                </View>
+
+                {/* Actions: Hỗ trợ lưu vào documents/ và chia sẻ PNG HD */}
                 <View style={styles.actionRow}>
                   <TouchableOpacity
                     style={[styles.primaryActionBtn, { backgroundColor: theme.accent }]}
-                    onPress={handleSaveImage}
+                    onPress={() => handleSaveToDocuments(true)}
                   >
-                    <Ionicons name="share-outline" size={20} color="#ffffff" />
-                    <Text style={styles.primaryActionText}> Lưu / Chia Sẻ QR</Text>
+                    <Ionicons name="folder-outline" size={18} color="#ffffff" />
+                    <Text style={styles.primaryActionText}> Lưu Documents (HD)</Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={[styles.primaryActionBtn, { backgroundColor: theme.green }]}
+                    onPress={() => handleShareQr(true)}
+                  >
+                    <Ionicons name="share-social-outline" size={18} color="#ffffff" />
+                    <Text style={styles.primaryActionText}> Chia Sẻ PNG HD</Text>
                   </TouchableOpacity>
 
                   <TouchableOpacity
@@ -625,7 +1017,6 @@ export default function QRGeneratorScreen({ navigation }: any) {
                     onPress={handleShareText}
                   >
                     <Ionicons name="copy-outline" size={18} color={theme.text} />
-                    <Text style={[styles.secondaryActionText, { color: theme.text }]}> Sao chép</Text>
                   </TouchableOpacity>
                 </View>
               </View>
@@ -661,7 +1052,12 @@ export default function QRGeneratorScreen({ navigation }: any) {
               </Text>
             </View>
           ) : (
-            <ScrollView contentContainerStyle={{ padding: 16 }}>
+            <ScrollView
+              contentContainerStyle={{
+                padding: 16,
+                paddingBottom: Math.max(insets.bottom, 16) + 24,
+              }}
+            >
               {history.map((item) => (
                 <View
                   key={item.id}
@@ -711,7 +1107,6 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingTop: 48,
     paddingBottom: 14,
     paddingHorizontal: 16,
     borderBottomWidth: 1,
@@ -794,6 +1189,39 @@ const styles = StyleSheet.create({
   charCount: {
     fontSize: 12,
   },
+  errorBanner: {
+    marginTop: 10,
+    padding: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+  },
+  errorBannerTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#dc2626',
+  },
+  errorBannerText: {
+    fontSize: 12,
+    color: '#b91c1c',
+    lineHeight: 18,
+    marginTop: 2,
+  },
+  errorBannerActions: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 8,
+  },
+  errorActionChip: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 6,
+  },
+  errorActionChipText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#b91c1c',
+  },
   subLabel: {
     fontSize: 13,
     fontWeight: '600',
@@ -870,6 +1298,22 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '600',
   },
+  formatRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  formatChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderRadius: 8,
+    borderWidth: 1,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+  },
+  formatChipText: {
+    fontSize: 12,
+  },
   qrDisplayCard: {
     alignItems: 'center',
   },
@@ -877,11 +1321,18 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     paddingVertical: 32,
+    paddingHorizontal: 16,
+  },
+  placeholderTitle: {
+    fontSize: 15,
+    fontWeight: '700',
+    textAlign: 'center',
   },
   placeholderText: {
     fontSize: 13,
     textAlign: 'center',
-    marginTop: 10,
+    marginTop: 6,
+    lineHeight: 18,
   },
   qrContainer: {
     alignItems: 'center',
@@ -894,42 +1345,51 @@ const styles = StyleSheet.create({
     shadowColor: '#000',
     shadowOpacity: 0.1,
     shadowRadius: 8,
-    marginBottom: 16,
+    marginBottom: 12,
   },
   qrImage: {
     width: 220,
     height: 220,
   },
+  resBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 5,
+    borderRadius: 12,
+    borderWidth: 1,
+    marginBottom: 16,
+  },
+  resBadgeText: {
+    fontSize: 12,
+    fontWeight: '500',
+  },
   actionRow: {
     flexDirection: 'row',
     width: '100%',
-    gap: 10,
+    gap: 8,
   },
   primaryActionBtn: {
-    flex: 2,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: 12,
-    borderRadius: 10,
-  },
-  primaryActionText: {
-    color: '#ffffff',
-    fontSize: 14,
-    fontWeight: '700',
-  },
-  secondaryActionBtn: {
     flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
     paddingVertical: 12,
+    paddingHorizontal: 8,
+    borderRadius: 10,
+  },
+  primaryActionText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  secondaryActionBtn: {
+    width: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 12,
     borderRadius: 10,
     borderWidth: 1,
-  },
-  secondaryActionText: {
-    fontSize: 13,
-    fontWeight: '600',
   },
   historyContainer: {
     flex: 1,

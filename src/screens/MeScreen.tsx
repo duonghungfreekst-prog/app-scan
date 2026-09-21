@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, Alert, Switch,
-  ScrollView, TextInput, Modal, Dimensions
+  ScrollView, TextInput, Modal, Dimensions, ActivityIndicator
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as DocumentPicker from 'expo-document-picker';
@@ -15,10 +16,12 @@ import { STORAGE_KEYS, CAPABILITY_MATRIX } from '../constants/config';
 import { ScanQuality, ColorMode } from '../types/domain';
 import { getGoogleClientId, saveGoogleClientId, checkGoogleConfigured } from '../utils/googleSync';
 import BackupService from '../services/backup/backup.service';
+import { cleanupTempCache, getDirectorySize, getDocumentDirectory } from '../utils/fileHelper';
 
 const { width } = Dimensions.get('window');
 
 export default function MeScreen({ navigation }: any) {
+  const insets = useSafeAreaInsets();
   const { theme, isDark, toggleDark } = useTheme();
   const [scanQuality, setScanQuality] = useState<ScanQuality>('high');
   const [colorMode, setColorMode] = useState<ColorMode>('color');
@@ -27,11 +30,51 @@ export default function MeScreen({ navigation }: any) {
   const [googleClientIdAndroid, setGoogleClientIdAndroid] = useState('');
   const [googleClientIdWeb, setGoogleClientIdWeb] = useState('');
   const [isGoogleConfiguredState, setIsGoogleConfiguredState] = useState(false);
+  const [docStorageSize, setDocStorageSize] = useState<number>(0);
+  const [isCleaningCache, setIsCleaningCache] = useState(false);
 
   // Modal Ma trận năng lực
   const [matrixVisible, setMatrixVisible] = useState(false);
 
-  useEffect(() => { loadSettings(); }, []);
+  useEffect(() => {
+    loadSettings();
+    loadStorageUsage();
+  }, []);
+
+  const loadStorageUsage = async () => {
+    try {
+      const docDir = getDocumentDirectory();
+      const size = await getDirectorySize(docDir);
+      setDocStorageSize(size);
+    } catch {
+      setDocStorageSize(0);
+    }
+  };
+
+  const formatStorageSize = (bytes: number): string => {
+    if (bytes <= 0) return '0 B';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  };
+
+  const handleCleanupTempCache = async () => {
+    try {
+      setIsCleaningCache(true);
+      const cleanedCount = await cleanupTempCache();
+      await loadStorageUsage();
+      Alert.alert(
+        '✅ Đã dọn dẹp bộ nhớ tạm',
+        cleanedCount > 0
+          ? `Đã giải phóng thành công ${cleanedCount} tệp tin tạm (cache).`
+          : 'Bộ nhớ tạm hiện đang sạch sẽ, không có tệp thừa.'
+      );
+    } catch (e: any) {
+      Alert.alert('Lỗi dọn dẹp', e.message || 'Không thể dọn dẹp bộ nhớ tạm.');
+    } finally {
+      setIsCleaningCache(false);
+    }
+  };
 
   const loadSettings = async () => {
     try {
@@ -41,6 +84,7 @@ export default function MeScreen({ navigation }: any) {
       const key = await SecureStorage.getItem(STORAGE_KEYS.GEMINI_API_KEY);
       const { android, web } = await getGoogleClientId();
       const googleReady = await checkGoogleConfigured();
+      await Storage.getItem(STORAGE_KEYS.THEME_MODE);
 
       if (q) setScanQuality(q as ScanQuality);
       if (c) setColorMode(c as ColorMode);
@@ -62,6 +106,11 @@ export default function MeScreen({ navigation }: any) {
     }
   };
 
+  const handleToggleDark = async () => {
+    toggleDark();
+    await saveSetting(STORAGE_KEYS.THEME_MODE, String(!isDark));
+  };
+
   const handleToggleSaveOriginal = async (val: boolean) => {
     setSaveOriginal(val);
     await saveSetting(STORAGE_KEYS.SAVE_ORIGINAL, String(val));
@@ -75,6 +124,19 @@ export default function MeScreen({ navigation }: any) {
   const handleSelectColorMode = async (c: ColorMode) => {
     setColorMode(c);
     await saveSetting(STORAGE_KEYS.COLOR_MODE, c);
+  };
+
+  const handleDeleteGeminiKey = async () => {
+    try {
+      await SecureStorage.removeItem(STORAGE_KEYS.GEMINI_API_KEY);
+      setGeminiApiKey('');
+      Alert.alert(
+        '✅ Đã xóa API Key',
+        'Đã xóa API Key khỏi máy. Các tính năng AI (OCR, Giải toán AI) sẽ tạm ngưng cho tới khi bạn cấu hình lại key.'
+      );
+    } catch {
+      Alert.alert('Lỗi', 'Không thể xóa API Key an toàn. Vui lòng thử lại.');
+    }
   };
 
   const saveGeminiKey = async () => {
@@ -91,11 +153,7 @@ export default function MeScreen({ navigation }: any) {
           'Gemini Vision API Key đã được mã hóa an toàn trong phần cứng thiết bị (Android Keystore / iOS Keychain).\n\nLưu ý: Ảnh tài liệu gửi qua tính năng AI sẽ được truyền trực tiếp tới máy chủ Google Gemini theo chính sách BYOK cá nhân.'
         );
       } else {
-        await SecureStorage.removeItem(STORAGE_KEYS.GEMINI_API_KEY);
-        Alert.alert(
-          '✅ Đã xóa API Key',
-          'Đã xóa API Key khỏi máy. Các tính năng AI (OCR, Giải toán AI) sẽ tạm ngưng cho tới khi bạn cấu hình lại key.'
-        );
+        await handleDeleteGeminiKey();
       }
     } catch {
       Alert.alert('Lỗi', 'Không thể lưu API Key an toàn. Vui lòng thử lại.');
@@ -134,10 +192,7 @@ export default function MeScreen({ navigation }: any) {
       });
       if (!result.canceled && result.assets && result.assets.length > 0) {
         const fileUri = result.assets[0].uri;
-        const content = await FileSystem.readAsStringAsync(fileUri, {
-          encoding: FileSystem.EncodingType.UTF8,
-        });
-        const res = await BackupService.restoreFromJson(content);
+        const res = await BackupService.restoreBackup(fileUri);
         if (res.success) {
           await loadSettings();
           Alert.alert('✅ Khôi phục thành công', `Đã phục hồi ${res.restoredCount} mục cấu hình và dữ liệu OCR!`);
@@ -164,7 +219,7 @@ export default function MeScreen({ navigation }: any) {
 
   return (
     <ScrollView style={[s.container, { backgroundColor: theme.bg }]} contentContainerStyle={{ paddingBottom: 50 }} showsVerticalScrollIndicator={false}>
-      <LinearGradient colors={[theme.gradStart, theme.gradEnd]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={s.header}>
+      <LinearGradient colors={[theme.gradStart, theme.gradEnd]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={[s.header, { paddingTop: Math.max(insets.top + 20, 50) }]}>
         <View style={s.avatar}>
           <Ionicons name="document-text" size={38} color="#00e5cc" />
         </View>
@@ -184,7 +239,7 @@ export default function MeScreen({ navigation }: any) {
           </View>
           <Switch
             value={isDark}
-            onValueChange={toggleDark}
+            onValueChange={handleToggleDark}
             trackColor={{ false: theme.switchTrackOff, true: theme.accent }}
             thumbColor="#fff"
           />
@@ -216,7 +271,8 @@ export default function MeScreen({ navigation }: any) {
           {geminiApiKey.length > 0 && (
             <TouchableOpacity
               style={[s.saveKeyBtn, { backgroundColor: theme.surface, borderWidth: 1, borderColor: theme.border }]}
-              onPress={() => { setGeminiApiKey(''); saveGeminiKey(); }}
+              onPress={handleDeleteGeminiKey}
+              activeOpacity={0.7}
             >
               <Text style={[s.saveKeyText, { color: theme.danger }]}>Xóa</Text>
             </TouchableOpacity>
@@ -369,6 +425,39 @@ export default function MeScreen({ navigation }: any) {
         </View>
       </View>
 
+      {/* Dung lượng bộ nhớ & Dọn dẹp bộ nhớ tạm */}
+      <View style={[s.section, { backgroundColor: theme.card, borderColor: theme.border }]}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+            <Ionicons name="pie-chart" size={18} color={theme.accent} style={{ marginRight: 6 }} />
+            <Text style={[s.sectionTitle, { color: theme.text, marginBottom: 0 }]}>Dung lượng & Bộ nhớ</Text>
+          </View>
+          <View style={[s.statusBadge, { backgroundColor: theme.surface }]}>
+            <Text style={{ fontSize: 12, fontWeight: 'bold', color: theme.accent }}>
+              {formatStorageSize(docStorageSize)}
+            </Text>
+          </View>
+        </View>
+        <Text style={[s.switchDesc, { color: theme.textSub, marginBottom: 12 }]}>
+          Tổng dung lượng tài liệu scan trên thiết bị: {formatStorageSize(docStorageSize)}. Dọn dẹp các tệp ảnh nháp và bộ nhớ tạm (cache) để tối ưu không gian lưu trữ.
+        </Text>
+        <TouchableOpacity
+          style={[s.saveKeyBtn, { backgroundColor: theme.surface, borderWidth: 1, borderColor: theme.border, flexDirection: 'row' }]}
+          onPress={handleCleanupTempCache}
+          disabled={isCleaningCache}
+          activeOpacity={0.7}
+        >
+          {isCleaningCache ? (
+            <ActivityIndicator size="small" color={theme.danger} style={{ marginRight: 8 }} />
+          ) : (
+            <Ionicons name="trash-outline" size={18} color={theme.danger} style={{ marginRight: 6 }} />
+          )}
+          <Text style={[s.saveKeyText, { color: theme.danger }]}>
+            {isCleaningCache ? 'Đang dọn dẹp...' : 'Dọn dẹp bộ nhớ tạm'}
+          </Text>
+        </TouchableOpacity>
+      </View>
+
       {/* Menu & About */}
       <View style={[s.menu, { backgroundColor: theme.card, borderColor: theme.border }]}>
         <TouchableOpacity
@@ -453,7 +542,7 @@ export default function MeScreen({ navigation }: any) {
 const s = StyleSheet.create({
   container: { flex: 1 },
   header: {
-    paddingTop: 80, paddingBottom: 40, alignItems: 'center',
+    paddingBottom: 40, alignItems: 'center',
     borderBottomLeftRadius: 32, borderBottomRightRadius: 32,
     marginBottom: 16, elevation: 8,
     shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.3, shadowRadius: 8,

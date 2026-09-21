@@ -1,11 +1,12 @@
 import React, { Suspense, lazy } from 'react';
 import { View, ActivityIndicator } from 'react-native';
-import { NavigationContainer } from '@react-navigation/native';
+import { NavigationContainer, DarkTheme, DefaultTheme, LinkingOptions } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { Ionicons } from '@expo/vector-icons';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 
 import HomeScreen from './src/screens/HomeScreen';
 import FilesScreen from './src/screens/FilesScreen';
@@ -80,11 +81,18 @@ function TabNavigator() {
   );
 }
 
-const linking = {
+const linking: LinkingOptions<RootStackParamList> = {
   prefixes: ['camscanner://', 'camscannerexpo://'],
   config: {
     screens: {
-      MainTabs: '',
+      MainTabs: {
+        screens: {
+          Home: 'home',
+          Files: 'files',
+          Tools: 'tools',
+          Me: 'me',
+        },
+      },
       Scanner: 'scanner',
       QRScanner: 'qrscanner',
       QRGenerator: 'qrgenerator',
@@ -95,11 +103,11 @@ const linking = {
 import UpdateChecker from './src/components/UpdateChecker';
 
 function AppInner() {
-  const { theme } = useTheme();
+  const { theme, isDark } = useTheme();
   return (
     <>
       <StatusBar style={theme.dark ? 'light' : 'dark'} />
-      <NavigationContainer linking={linking}>
+      <NavigationContainer theme={isDark ? DarkTheme : DefaultTheme} linking={linking}>
         <Stack.Navigator screenOptions={{ headerShown: false }}>
           <Stack.Screen name="MainTabs" component={TabNavigator} />
           <Stack.Screen name="Scanner" component={LazyScanner} />
@@ -116,12 +124,14 @@ import { ErrorBoundary } from './src/components/ErrorBoundary';
 
 export default function App() {
   return (
-    <SafeAreaProvider>
-      <ErrorBoundary>
-        <ThemeProvider>
-          <AppInner />
-        </ThemeProvider>
-      </ErrorBoundary>
-    </SafeAreaProvider>
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      <SafeAreaProvider>
+        <ErrorBoundary>
+          <ThemeProvider>
+            <AppInner />
+          </ThemeProvider>
+        </ErrorBoundary>
+      </SafeAreaProvider>
+    </GestureHandlerRootView>
   );
 }

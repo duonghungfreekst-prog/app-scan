@@ -1,6 +1,6 @@
 import React, { useState, useCallback } from 'react';
 import {
-  View, Text, StyleSheet, TouchableOpacity, ScrollView, Alert, Modal,
+  View, Text, StyleSheet, TouchableOpacity, FlatList, Alert, Modal,
   TextInput, Platform, ActivityIndicator
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
@@ -137,18 +137,37 @@ export default function FilesScreen() {
     try {
       const lastDot = selectedItem.name.lastIndexOf('.');
       const ext = lastDot !== -1 ? selectedItem.name.substring(lastDot) : '';
-      const cleanName = renameValue.trim().replace(/[^a-zA-Z0-9_\-\sÀ-ÿ]/g, '_');
-      const newFileName = cleanName + ext;
+      const cleanName = renameValue.trim().replace(/[^\p{L}\p{N}_\-\s]/gu, '');
+      if (!cleanName) {
+        Alert.alert('Lỗi', 'Vui lòng nhập tên tài liệu hợp lệ.');
+        return;
+      }
+      let finalFileName = cleanName + ext;
+      if (finalFileName === selectedItem.name) {
+        setRenameDialogVisible(false);
+        setSelectedItem(null);
+        return;
+      }
+
       const root = getDocumentDirectory();
       const targetDir = currentFolder ? `${root}${currentFolder}/` : root;
-      const newUri = targetDir + newFileName;
+      let targetUri = targetDir + finalFileName;
 
-      await FileSystem.moveAsync({ from: selectedItem.uri, to: newUri });
-      await renameDocumentOcrText(selectedItem.name, newFileName);
+      let fileInfo = await FileSystem.getInfoAsync(targetUri);
+      let counter = 1;
+      while (fileInfo.exists) {
+        finalFileName = `${cleanName}_${counter}${ext}`;
+        targetUri = targetDir + finalFileName;
+        fileInfo = await FileSystem.getInfoAsync(targetUri);
+        counter++;
+      }
+
+      await FileSystem.moveAsync({ from: selectedItem.uri, to: targetUri });
+      await renameDocumentOcrText(selectedItem.name, finalFileName);
       setRenameDialogVisible(false);
       setSelectedItem(null);
       loadFiles();
-      Alert.alert('✅ Thành công', `Đã đổi tên thành "${newFileName}"`);
+      Alert.alert('✅ Thành công', `Đã đổi tên thành "${finalFileName}"`);
     } catch {
       Alert.alert('Lỗi', 'Không thể đổi tên file.');
     }
@@ -310,56 +329,61 @@ export default function FilesScreen() {
       </View>
 
       {/* File List */}
-      <ScrollView contentContainerStyle={s.content} showsVerticalScrollIndicator={false}>
-        {filteredItems.length === 0 ? (
+      <FlatList
+        data={filteredItems}
+        keyExtractor={(item) => item.id || item.uri}
+        initialNumToRender={15}
+        maxToRenderPerBatch={10}
+        windowSize={5}
+        contentContainerStyle={s.content}
+        showsVerticalScrollIndicator={false}
+        ListEmptyComponent={
           <View style={[s.emptyCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
             <Ionicons name="documents-outline" size={52} color={theme.textMuted} />
             <Text style={[s.emptyText, { color: theme.textMuted }]}>
               {searchQuery ? 'Không tìm thấy tài liệu phù hợp tên hoặc nội dung.' : 'Thư mục này đang trống.'}
             </Text>
           </View>
-        ) : (
-          filteredItems.map((item, index) => {
-            const visual = getItemVisual(item);
-            const sizeStr = formatFileSize(item.size);
+        }
+        renderItem={({ item }) => {
+          const visual = getItemVisual(item);
+          const sizeStr = formatFileSize(item.size);
 
-            return (
-              <TouchableOpacity
-                key={item.id || index}
-                style={[s.fileItem, { backgroundColor: theme.card, borderColor: theme.border }]}
-                onPress={() => handleItemPress(item)}
-                activeOpacity={0.7}
-              >
-                <View style={[s.fileIconBg, { backgroundColor: visual.bg }]}>
-                  <Ionicons name={visual.icon as any} size={24} color={visual.color} />
-                </View>
+          return (
+            <TouchableOpacity
+              style={[s.fileItem, { backgroundColor: theme.card, borderColor: theme.border }]}
+              onPress={() => handleItemPress(item)}
+              activeOpacity={0.7}
+            >
+              <View style={[s.fileIconBg, { backgroundColor: visual.bg }]}>
+                <Ionicons name={visual.icon as any} size={24} color={visual.color} />
+              </View>
 
-                <View style={s.fileInfo}>
-                  <Text style={[s.fileName, { color: theme.text }]} numberOfLines={1}>{item.name}</Text>
-                  <Text style={[s.fileMeta, { color: theme.textSub }]}>
-                    {visual.label} {sizeStr ? `• ${sizeStr}` : ''}
+              <View style={s.fileInfo}>
+                <Text style={[s.fileName, { color: theme.text }]} numberOfLines={1}>{item.name}</Text>
+                <Text style={[s.fileMeta, { color: theme.textSub }]}>
+                  {visual.label} {sizeStr ? `• ${sizeStr}` : ''}
+                </Text>
+                {trimmedQuery.length > 0 && item.ocrText && item.ocrText.toLowerCase().includes(trimmedQuery) && (
+                  <Text style={[s.ocrSnippet, { color: theme.accent }]} numberOfLines={1}>
+                    🔍 Khớp nội dung: "{getOcrSnippet(item.ocrText, trimmedQuery)}"
                   </Text>
-                  {trimmedQuery.length > 0 && item.ocrText && item.ocrText.toLowerCase().includes(trimmedQuery) && (
-                    <Text style={[s.ocrSnippet, { color: theme.accent }]} numberOfLines={1}>
-                      🔍 Khớp nội dung: "{getOcrSnippet(item.ocrText, trimmedQuery)}"
-                    </Text>
-                  )}
-                </View>
-
-                {!item.isDirectory && (
-                  <TouchableOpacity onPress={() => handleShareFile(item)} style={[s.iconBtn, { backgroundColor: theme.surface }]}>
-                    <Ionicons name="share-social" size={18} color={theme.blue} />
-                  </TouchableOpacity>
                 )}
+              </View>
 
-                <TouchableOpacity onPress={() => handleDeleteItem(item)} style={[s.iconBtn, { backgroundColor: theme.surface }]}>
-                  <Ionicons name="trash" size={18} color={theme.danger} />
+              {!item.isDirectory && (
+                <TouchableOpacity onPress={() => handleShareFile(item)} style={[s.iconBtn, { backgroundColor: theme.surface }]}>
+                  <Ionicons name="share-social" size={18} color={theme.blue} />
                 </TouchableOpacity>
+              )}
+
+              <TouchableOpacity onPress={() => handleDeleteItem(item)} style={[s.iconBtn, { backgroundColor: theme.surface }]}>
+                <Ionicons name="trash" size={18} color={theme.danger} />
               </TouchableOpacity>
-            );
-          })
-        )}
-      </ScrollView>
+            </TouchableOpacity>
+          );
+        }}
+      />
 
       {/* Create Folder Modal */}
       <Modal visible={folderDialogVisible} animationType="fade" transparent>

@@ -1,17 +1,42 @@
-import React, { useState } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, Alert, Modal, Linking } from 'react-native';
+import React, { useState, useEffect } from 'react';
+import { View, Text, StyleSheet, TouchableOpacity, Alert, Modal, Linking, AppState, AppStateStatus } from 'react-native';
 import { CameraView, useCameraPermissions, Camera } from 'expo-camera';
 import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../theme';
 import * as Clipboard from 'expo-clipboard';
 import * as ImagePicker from 'expo-image-picker';
+import { useIsFocused } from '@react-navigation/native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 export default function QRScannerScreen({ navigation }: any) {
   const { theme } = useTheme();
+  const insets = useSafeAreaInsets();
+  const isFocused = useIsFocused();
+  const [appState, setAppState] = useState<AppStateStatus>(AppState.currentState);
   const [permission, requestPermission] = useCameraPermissions();
   const [scanned, setScanned] = useState(false);
   const [result, setResult] = useState('');
   const [modalVisible, setModalVisible] = useState(false);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextAppState) => {
+      setAppState(nextAppState);
+    });
+
+    return () => {
+      subscription.remove();
+    };
+  }, []);
+
+  const isCameraActive = isFocused && appState === 'active';
+
+  const handleGoBack = () => {
+    if (navigation?.canGoBack && navigation.canGoBack()) {
+      navigation.goBack();
+    } else if (navigation?.navigate) {
+      navigation.navigate('MainTabs');
+    }
+  };
 
   if (!permission) {
     return (
@@ -30,7 +55,7 @@ export default function QRScannerScreen({ navigation }: any) {
         <TouchableOpacity style={[styles.btn, { backgroundColor: theme.accent }]} onPress={requestPermission}>
           <Text style={styles.btnText}>Cấp quyền</Text>
         </TouchableOpacity>
-        <TouchableOpacity style={{ marginTop: 16 }} onPress={() => navigation.goBack()}>
+        <TouchableOpacity style={{ marginTop: 16 }} onPress={handleGoBack}>
           <Text style={{ color: theme.textSub }}>Quay lại</Text>
         </TouchableOpacity>
       </View>
@@ -132,43 +157,53 @@ export default function QRScannerScreen({ navigation }: any) {
 
   const isUrl = (str: string) => isSafeUrl(str);
 
+  const renderOverlay = () => (
+    <View style={styles.overlay}>
+      <View style={[styles.header, { paddingTop: Math.max(insets.top, 16) + 12 }]}>
+        <TouchableOpacity onPress={handleGoBack} style={styles.backBtn}>
+          <Ionicons name="chevron-back" size={28} color="#fff" />
+        </TouchableOpacity>
+        <Text style={styles.headerText}>Quét mã QR / Barcode</Text>
+        <TouchableOpacity onPress={handlePickImage} style={styles.backBtn}>
+          <Ionicons name="image-outline" size={28} color="#fff" />
+        </TouchableOpacity>
+      </View>
+      
+      <View style={styles.scanArea}>
+        <View style={styles.scanFrame} />
+      </View>
+
+      <View style={styles.footer}>
+        <Text style={styles.footerText}>Hướng camera vào mã để quét tự động</Text>
+        <TouchableOpacity
+          style={styles.genQrBtn}
+          onPress={() => navigation.navigate('QRGenerator')}
+        >
+          <Ionicons name="create-outline" size={18} color="#fff" />
+          <Text style={styles.genQrBtnText}> Tạo mã QR từ văn bản</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+
   return (
     <View style={styles.container}>
-      <CameraView
-        style={styles.camera}
-        facing="back"
-        barcodeScannerSettings={{
-          barcodeTypes: ['qr', 'ean13', 'ean8', 'pdf417', 'aztec', 'datamatrix', 'code39', 'code93', 'code128', 'upc_a', 'upc_e'],
-        }}
-        onBarcodeScanned={scanned ? undefined : handleBarCodeScanned}
-      >
-        <View style={styles.overlay}>
-          <View style={styles.header}>
-            <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
-              <Ionicons name="chevron-back" size={28} color="#fff" />
-            </TouchableOpacity>
-            <Text style={styles.headerText}>Quét mã QR / Barcode</Text>
-            <TouchableOpacity onPress={handlePickImage} style={styles.backBtn}>
-              <Ionicons name="image-outline" size={28} color="#fff" />
-            </TouchableOpacity>
-          </View>
-          
-          <View style={styles.scanArea}>
-            <View style={styles.scanFrame} />
-          </View>
-
-          <View style={styles.footer}>
-            <Text style={styles.footerText}>Hướng camera vào mã để quét tự động</Text>
-            <TouchableOpacity
-              style={styles.genQrBtn}
-              onPress={() => navigation.navigate('QRGenerator')}
-            >
-              <Ionicons name="create-outline" size={18} color="#fff" />
-              <Text style={styles.genQrBtnText}> Tạo mã QR từ văn bản</Text>
-            </TouchableOpacity>
-          </View>
+      {isCameraActive ? (
+        <CameraView
+          style={styles.camera}
+          facing="back"
+          barcodeScannerSettings={{
+            barcodeTypes: ['qr', 'ean13', 'ean8', 'pdf417', 'aztec', 'datamatrix', 'code39', 'code93', 'code128', 'upc_a', 'upc_e'],
+          }}
+          onBarcodeScanned={scanned ? undefined : handleBarCodeScanned}
+        >
+          {renderOverlay()}
+        </CameraView>
+      ) : (
+        <View style={[styles.camera, { backgroundColor: '#000' }]}>
+          {renderOverlay()}
         </View>
-      </CameraView>
+      )}
 
       <Modal visible={modalVisible} transparent animationType="fade">
         <View style={styles.modalBg}>
@@ -204,7 +239,7 @@ export default function QRScannerScreen({ navigation }: any) {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1 },
+  container: { flex: 1, backgroundColor: '#000' },
   camera: { flex: 1 },
   centerContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 20 },
   btn: { paddingHorizontal: 24, paddingVertical: 12, borderRadius: 8 },
@@ -218,7 +253,6 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingTop: 50,
     paddingHorizontal: 20,
     paddingBottom: 20,
   },

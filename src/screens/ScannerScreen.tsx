@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, Image, TextInput,
   ScrollView, Alert, KeyboardAvoidingView, Platform, Dimensions, ActivityIndicator,
-  FlatList, Modal
+  FlatList, Modal, BackHandler
 } from 'react-native';
 
 import * as Print from 'expo-print';
@@ -30,12 +30,47 @@ function getDocumentScanner(): any {
 }
 
 import { FilterMode, getCanvasProcessingScript, getCssFilterForMode } from '../utils/imageProcessor';
-import { savePdfToDocuments, getDocumentDirectory } from '../utils/fileHelper';
+import { savePdfToDocuments, getDocumentDirectory, cleanupTempCache, compressImageToTargetSize } from '../utils/fileHelper';
 import Storage from '../utils/storage';
 import { STORAGE_KEYS, IMAGE_PROCESSING_CONFIG } from '../constants/config';
 import CropView, { Point } from '../components/CropView';
 
+export type AspectRatioMode = 'a4' | 'id_card' | 'free';
+
 const { width, height } = Dimensions.get('window');
+
+// Hàm kiểm tra an toàn: Chỉ thao tác với file tạm trong thư mục cache của app
+export const isTempCacheUri = (uri: string): boolean => {
+  if (!uri || typeof uri !== 'string' || !uri.startsWith('file://')) return false;
+  const cacheDir = FileSystem.cacheDirectory;
+  return Boolean(cacheDir && uri.startsWith(cacheDir));
+};
+
+// Dọn dẹp danh sách file ảnh tạm an toàn để chống rò rỉ dung lượng bộ nhớ
+export const cleanupTempImages = async (uris: string[]): Promise<void> => {
+  if (!uris || !Array.isArray(uris)) return;
+  for (const uri of uris) {
+    try {
+      if (isTempCacheUri(uri)) {
+        await FileSystem.deleteAsync(uri, { idempotent: true });
+      }
+    } catch (err) {
+      console.warn('[Scanner] Failed to clean up temp image:', uri, err);
+    }
+  }
+};
+
+// Xóa sạch draft session ở cả key mới và key kế thừa
+export const removeDraftSession = async (): Promise<void> => {
+  try {
+    await Promise.all([
+      Storage.removeItem(STORAGE_KEYS.DRAFT_SCAN_SESSION),
+      Storage.removeItem('DRAFT_SCAN_SESSION'),
+    ]);
+  } catch (e) {
+    console.warn('[Scanner] Failed to remove draft session:', e);
+  }
+};
 
 export default function ScannerScreen({ route, navigation }: any) {
   const [images, setImages] = useState<string[]>([]);
@@ -43,11 +78,26 @@ export default function ScannerScreen({ route, navigation }: any) {
     return `SCAN_${Date.now()}`;
   };
 
+  const hasSavedRef = React.useRef(false);
+
+  // Điều hướng an toàn chống kẹt màn hình đen
+  const safeGoBack = () => {
+    if (navigation.canGoBack()) {
+      navigation.goBack();
+    } else {
+      navigation.navigate('MainTabs');
+    }
+  };
+
+  const [aspectRatioMode, setAspectRatioMode] = useState<AspectRatioMode>('a4');
+  const [exportProgress, setExportProgress] = useState<number>(0);
+  const [exportStatusText, setExportStatusText] = useState<string>('');
+
   const [filterMode, setFilterMode] = useState<FilterMode>('magic');
   const [scanQuality, setScanQuality] = useState<'high' | 'medium' | 'low'>('high');
   const [saveOriginal, setSaveOriginal] = useState(true);
   const [trimMargin, setTrimMargin] = useState(true); // Default to true to remove excess borders
-  const [bookMode, setBookMode] = useState<boolean>(route.params?.bookMode || false);
+  const [bookMode, setBookMode] = useState<boolean>(Boolean(route.params?.bookMode));
   const [watermark, setWatermark] = useState<string>('');
   const [watermarkModalVisible, setWatermarkModalVisible] = useState<boolean>(false);
   const [customWatermarkInput, setCustomWatermarkInput] = useState<string>('');
@@ -55,47 +105,126 @@ export default function ScannerScreen({ route, navigation }: any) {
   const [saving, setSaving] = useState(false);
   const [sharing, setSharing] = useState(false);
 
+  // TÍNH NĂNG MỚI: Xoay trang ảo (90/180/270), đóng dấu ngày giờ/số trang góc PDF,
+  // và nén theo dung lượng mục tiêu (targetSizeKB: 200/500/1000KB)
+  const [rotations, setRotations] = useState<{ [index: number]: number }>({});
+  const [addWatermark, setAddWatermark] = useState<boolean>(false);
+  const [targetSizeMode, setTargetSizeMode] = useState<boolean>(false);
+  const [targetSizeKB, setTargetSizeKB] = useState<number>(500);
+
+  // Đồng bộ tham số bookMode từ route.params
+  useEffect(() => {
+    if (typeof route.params?.bookMode === 'boolean') {
+      setBookMode(route.params.bookMode);
+    }
+  }, [route.params?.bookMode]);
+
+  // Cảnh báo xác nhận khi vuốt back hoặc điều hướng thoát màn hình mà đang có ảnh quét chưa lưu
+  useEffect(() => {
+    const unsubscribe = navigation.addListener('beforeRemove', (e: any) => {
+      if (images.length === 0 || hasSavedRef.current) {
+        return;
+      }
+
+      e.preventDefault();
+
+      Alert.alert(
+        'Thoát phiên quét?',
+        'Bạn có hình ảnh quét chưa lưu. Bạn có chắc muốn thoát mà không lưu?',
+        [
+          { text: 'Ở lại', style: 'cancel', onPress: () => {} },
+          {
+            text: 'Thoát',
+            style: 'destructive',
+            onPress: async () => {
+              hasSavedRef.current = true;
+              // Dọn dẹp sạch sẽ ảnh tạm và draft session khi người dùng chủ động hủy phiên quét
+              await cleanupTempImages(images);
+              await removeDraftSession();
+              navigation.dispatch(e.data.action);
+            },
+          },
+        ]
+      );
+    });
+
+    return () => {
+      unsubscribe();
+    };
+  }, [navigation, images]);
+
   // Crop State
   const [isCropping, setIsCropping] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
   const [customCorners, setCustomCorners] = useState<{ [index: number]: Point[] }>({});
   const [sessionChecked, setSessionChecked] = useState(false);
 
-  const DRAFT_SCAN_SESSION_KEY = 'DRAFT_SCAN_SESSION';
-
-  // Tự động lưu draft session mỗi khi images thay đổi
+  // Xử lý nút Back vật lý trên Android và dọn dẹp sạch sẽ khi component unmount
   useEffect(() => {
-    if (!sessionChecked) return;
-    const saveDraft = async () => {
+    const onBackPress = () => {
+      if (isCropping) {
+        setIsCropping(false);
+        return true;
+      }
+      if (watermarkModalVisible) {
+        setWatermarkModalVisible(false);
+        return true;
+      }
+      if (images.length > 0 && !hasSavedRef.current) {
+        safeGoBack();
+        return true;
+      }
+      return false;
+    };
+
+    const backSubscription = BackHandler.addEventListener('hardwareBackPress', onBackPress);
+    return () => {
+      backSubscription.remove();
+    };
+  }, [isCropping, watermarkModalVisible, images.length]);
+
+  // Tự động lưu draft session mỗi khi images/settings thay đổi (có debounce để tránh nghẽn I/O và rò rỉ bộ nhớ)
+  useEffect(() => {
+    if (!sessionChecked || hasSavedRef.current) return;
+
+    const timer = setTimeout(async () => {
+      if (hasSavedRef.current) return;
       try {
         if (images.length > 0) {
           await Storage.setItem(
-            DRAFT_SCAN_SESSION_KEY,
+            STORAGE_KEYS.DRAFT_SCAN_SESSION,
             JSON.stringify({
               images,
               fileName,
               filterMode,
               bookMode,
+              aspectRatioMode,
+              customCorners,
               timestamp: Date.now(),
             })
           );
         } else {
-          await Storage.removeItem(DRAFT_SCAN_SESSION_KEY);
+          await removeDraftSession();
         }
       } catch (e) {
         console.warn('[Scanner] Failed to save draft session:', e);
       }
+    }, 400);
+
+    return () => {
+      clearTimeout(timer);
     };
-    saveDraft();
-  }, [images, fileName, filterMode, bookMode, sessionChecked]);
+  }, [images, fileName, filterMode, bookMode, aspectRatioMode, customCorners, sessionChecked]);
 
   useEffect(() => {
+    let isMounted = true;
     // Tải cấu hình từ Cài đặt
     const initSettings = async () => {
       try {
         const q = await Storage.getItem(STORAGE_KEYS.SCAN_QUALITY);
         const c = await Storage.getItem(STORAGE_KEYS.COLOR_MODE);
         const s = await Storage.getItem(STORAGE_KEYS.SAVE_ORIGINAL);
+        if (!isMounted) return;
         if (q === 'high' || q === 'medium' || q === 'low') setScanQuality(q);
         if (c === 'grayscale') setFilterMode('grayscale');
         else if (c === 'bw') setFilterMode('bw');
@@ -106,6 +235,9 @@ export default function ScannerScreen({ route, navigation }: any) {
       }
     };
     initSettings();
+    return () => {
+      isMounted = false;
+    };
   }, []);
 
   const pickImage = async () => {
@@ -129,7 +261,7 @@ export default function ScannerScreen({ route, navigation }: any) {
       const perm = await ImagePicker.requestCameraPermissionsAsync();
       if (!perm.granted) {
         Alert.alert('Quyền truy cập Camera', 'Ứng dụng cần quyền sử dụng máy ảnh để chụp tài liệu.');
-        if (images.length === 0) navigation.goBack();
+        if (images.length === 0) safeGoBack();
         return;
       }
       const result = await ImagePicker.launchCameraAsync({
@@ -138,11 +270,11 @@ export default function ScannerScreen({ route, navigation }: any) {
       if (!result.canceled && result.assets && result.assets.length > 0) {
         setImages(prev => [...prev, result.assets[0].uri]);
       } else if (images.length === 0) {
-        navigation.goBack();
+        safeGoBack();
       }
     } catch (err) {
       console.warn('[Scanner] Camera fallback error:', err);
-      if (images.length === 0) navigation.goBack();
+      if (images.length === 0) safeGoBack();
     }
   };
 
@@ -154,7 +286,7 @@ export default function ScannerScreen({ route, navigation }: any) {
           'Máy quét tài liệu',
           'Trình quét phần cứng (Google ML Kit) chưa sẵn sàng hoặc không hỗ trợ trên thiết bị này. Bạn có muốn chụp ảnh bằng camera hoặc chọn ảnh từ thư viện?',
           [
-            { text: 'Hủy', style: 'cancel', onPress: () => { if (images.length === 0) navigation.goBack(); } },
+            { text: 'Hủy', style: 'cancel', onPress: () => { if (images.length === 0) safeGoBack(); } },
             { text: 'Chụp ảnh', onPress: takePhotoFallback },
             { text: 'Chọn ảnh', onPress: pickImage },
           ]
@@ -169,7 +301,7 @@ export default function ScannerScreen({ route, navigation }: any) {
       if (status === 'success' && scannedImages && scannedImages.length > 0) {
         setImages(prev => [...prev, ...scannedImages]);
       } else if (images.length === 0) {
-        navigation.goBack();
+        safeGoBack();
       }
     } catch (e: any) {
       console.error('[Scanner] DocumentScanner error:', e);
@@ -177,7 +309,7 @@ export default function ScannerScreen({ route, navigation }: any) {
         'Lỗi máy quét',
         'Không thể khởi động máy quét tự động. Bạn có muốn dùng máy ảnh thông thường?',
         [
-          { text: 'Hủy', style: 'cancel', onPress: () => { if (images.length === 0) navigation.goBack(); } },
+          { text: 'Hủy', style: 'cancel', onPress: () => { if (images.length === 0) safeGoBack(); } },
           { text: 'Chụp camera', onPress: takePhotoFallback },
           { text: 'Chọn ảnh', onPress: pickImage },
         ]
@@ -186,41 +318,88 @@ export default function ScannerScreen({ route, navigation }: any) {
   };
 
   useEffect(() => {
+    let isMounted = true;
+
     // 1. Nếu có ảnh truyền sang từ route.params (ví dụ từ FilesScreen hoặc ToolsScreen)
     if (route.params?.importImages && Array.isArray(route.params.importImages) && route.params.importImages.length > 0) {
       setImages(route.params.importImages);
       setSessionChecked(true);
-      return;
+      return () => {
+        isMounted = false;
+      };
     }
 
     // 2. Kiểm tra draft session trước khi bắt đầu quét mới
     const checkDraftAndInit = async () => {
       try {
-        const rawDraft = await Storage.getItem(DRAFT_SCAN_SESSION_KEY);
+        const rawDraft =
+          (await Storage.getItem(STORAGE_KEYS.DRAFT_SCAN_SESSION)) ||
+          (await Storage.getItem('DRAFT_SCAN_SESSION'));
+
         if (rawDraft) {
           const draft = JSON.parse(rawDraft);
           const isRecent = Date.now() - (draft.timestamp || 0) < 24 * 60 * 60 * 1000;
+
           if (isRecent && Array.isArray(draft.images) && draft.images.length > 0) {
+            // Xác thực xem các file ảnh trong draft có thực sự tồn tại trên đĩa hay không
+            const validImages: string[] = [];
+            for (const uri of draft.images) {
+              if (typeof uri !== 'string') continue;
+              if (uri.startsWith('file://')) {
+                try {
+                  const info = await FileSystem.getInfoAsync(uri);
+                  if (info.exists) {
+                    validImages.push(uri);
+                  }
+                } catch {
+                  // Bỏ qua file không truy cập được
+                }
+              } else {
+                validImages.push(uri);
+              }
+            }
+
+            // Nếu không còn file nào khả dụng (bị OS dọn cache), dọn dẹp draft hỏng ngay lập tức
+            if (validImages.length === 0) {
+              await removeDraftSession();
+              if (isMounted) {
+                setSessionChecked(true);
+                startScan();
+              }
+              return;
+            }
+
+            if (!isMounted) return;
+
             Alert.alert(
               '📄 Khôi phục phiên quét',
-              `Tìm thấy phiên quét dở dang gồm ${draft.images.length} trang chưa lưu. Bạn có muốn tiếp tục không?`,
+              `Tìm thấy phiên quét dở dang gồm ${validImages.length} trang chưa lưu. Bạn có muốn tiếp tục không?`,
               [
                 {
                   text: 'Bỏ qua',
                   style: 'destructive',
                   onPress: async () => {
-                    await Storage.removeItem(DRAFT_SCAN_SESSION_KEY);
-                    setSessionChecked(true);
-                    startScan();
+                    // Xóa triệt để các file ảnh tạm của draft cũ để không làm rò rỉ dung lượng
+                    await cleanupTempImages(draft.images);
+                    await removeDraftSession();
+                    if (isMounted) {
+                      setSessionChecked(true);
+                      startScan();
+                    }
                   },
                 },
                 {
                   text: 'Khôi phục',
                   onPress: () => {
-                    setImages(draft.images);
+                    if (!isMounted) return;
+                    setImages(validImages);
                     if (draft.fileName) setFileName(draft.fileName);
                     if (draft.filterMode) setFilterMode(draft.filterMode);
-                    if (typeof draft.bookMode === 'boolean') setBookMode(draft.bookMode);
+                    if (draft.aspectRatioMode) setAspectRatioMode(draft.aspectRatioMode);
+                    if (draft.customCorners) setCustomCorners(draft.customCorners);
+                    if (typeof draft.bookMode === 'boolean' && route.params?.bookMode === undefined) {
+                      setBookMode(draft.bookMode);
+                    }
                     setSessionChecked(true);
                   },
                 },
@@ -228,23 +407,41 @@ export default function ScannerScreen({ route, navigation }: any) {
             );
             return;
           } else {
-            await Storage.removeItem(DRAFT_SCAN_SESSION_KEY);
+            // Draft đã hết hạn (> 24h) hoặc rỗng: dọn dẹp sạch cả file tạm và storage
+            if (Array.isArray(draft.images)) {
+              await cleanupTempImages(draft.images);
+            }
+            await removeDraftSession();
           }
         }
       } catch (e) {
         console.warn('[Scanner] Error checking draft:', e);
       }
-      setSessionChecked(true);
-      startScan();
+      if (isMounted) {
+        setSessionChecked(true);
+        startScan();
+      }
     };
 
     checkDraftAndInit();
+
+    return () => {
+      isMounted = false;
+    };
   }, [route.params?.importImages]);
 
-
   const handleDeleteImage = async (index: number) => {
+    const targetUri = images[index];
     const remaining = images.filter((_, i) => i !== index);
     setImages(remaining);
+
+    // Giải phóng ngay file tạm của ảnh bị xóa khỏi cache
+    if (targetUri && isTempCacheUri(targetUri)) {
+      FileSystem.deleteAsync(targetUri, { idempotent: true }).catch(err =>
+        console.warn('[Scanner] Error deleting removed image file:', err)
+      );
+    }
+
     setCustomCorners(prev => {
       const next = { ...prev };
       delete next[index];
@@ -259,38 +456,34 @@ export default function ScannerScreen({ route, navigation }: any) {
       });
       return remapped;
     });
+
+    setRotations(prev => {
+      const next = { ...prev };
+      delete next[index];
+      const remapped: any = {};
+      Object.keys(next).forEach(k => {
+        const kNum = parseInt(k);
+        if (kNum > index) {
+          remapped[kNum - 1] = next[kNum];
+        } else {
+          remapped[kNum] = next[kNum];
+        }
+      });
+      return remapped;
+    });
+
     if (remaining.length === 0) {
-      await Storage.removeItem(DRAFT_SCAN_SESSION_KEY);
-      navigation.goBack();
+      hasSavedRef.current = true;
+      await removeDraftSession();
+      safeGoBack();
     }
   };
 
-  const handleRotateImage = async (index: number) => {
-    try {
-      const targetUri = images[index];
-      const manipResult = await ImageManipulator.manipulateAsync(
-        targetUri,
-        [{ rotate: 90 }],
-        { compress: 1, format: ImageManipulator.SaveFormat.JPEG }
-      );
-      const updated = [...images];
-      updated[index] = manipResult.uri;
-      setImages(updated);
-
-      if (customCorners[index]) {
-        setCustomCorners(prev => {
-          const next = { ...prev };
-          next[index] = next[index].map(pt => ({
-            x: Math.max(0, Math.min(1, 1 - pt.y)),
-            y: Math.max(0, Math.min(1, pt.x)),
-          }));
-          return next;
-        });
-      }
-    } catch (err) {
-      console.warn('[Scanner] Rotate image error:', err);
-      Alert.alert('Lỗi', 'Không thể xoay ảnh này.');
-    }
+  // TÍNH NĂNG MỚI: Xoay trang ảo 90 độ mỗi lần bấm. Góc xoay được lưu trong state
+  // và áp dụng thật khi xuất PDF (createPdf), giúp giao diện phản hồi tức thì
+  // mà không phải chờ I/O đĩa ghi file ảnh nhiều lần.
+  const handleRotateImage = (index: number) => {
+    setRotations(prev => ({ ...prev, [index]: ((prev[index] || 0) + 90) % 360 }));
   };
 
   const handleMoveImage = (index: number, direction: 'left' | 'right') => {
@@ -311,9 +504,19 @@ export default function ScannerScreen({ route, navigation }: any) {
       if (cTarget) next[index] = cTarget; else delete next[index];
       return next;
     });
+
+    setRotations(prev => {
+      const next = { ...prev };
+      const rCurrent = next[index];
+      const rTarget = next[targetIdx];
+      if (rCurrent !== undefined) next[targetIdx] = rCurrent; else delete next[targetIdx];
+      if (rTarget !== undefined) next[index] = rTarget; else delete next[index];
+      return next;
+    });
   };
 
-  const createPdf = async () => {
+  const createPdf = async (onProgress?: (percent: number, statusText: string) => void) => {
+    onProgress?.(5, 'Đang chuẩn bị trang quét...');
     const trimPercent = trimMargin
       ? IMAGE_PROCESSING_CONFIG.EDGE_CLEANUP_TRIM_PERCENT
       : IMAGE_PROCESSING_CONFIG.DEFAULT_TRIM_MARGIN_PERCENT;
@@ -335,8 +538,16 @@ export default function ScannerScreen({ route, navigation }: any) {
       scanContrast = 1.35;
     }
 
+    // Xác định kích thước trang PDF theo tỷ lệ khung hình đã chọn
+    const isIdCard = aspectRatioMode === 'id_card';
+    const pageWidth = isIdCard ? '1712px' : '2480px';
+    const pageHeight = isIdCard ? '1080px' : '3508px';
+    const printWidth = isIdCard ? 242.65 : 595.28;
+    const printHeight = isIdCard ? 153.01 : 841.89;
+
     // Xử lý nén ảnh theo batch nhỏ và dùng trực tiếp file URI (không nhồi Base64 vào JS RAM)
     const imgTagsArray: string[] = [];
+    const generatedTempUris: string[] = [];
     const BATCH_SIZE = 2;
     for (let i = 0; i < images.length; i += BATCH_SIZE) {
       const batch = images.slice(i, i + BATCH_SIZE);
@@ -346,26 +557,57 @@ export default function ScannerScreen({ route, navigation }: any) {
           let fileUri = imgUri;
           if (!imgUri.startsWith('data:')) {
             try {
-              const manipResult = await ImageManipulator.manipulateAsync(
-                imgUri,
-                [{ resize: { width: targetWidth } }],
-                { compress: targetCompress, format: ImageManipulator.SaveFormat.JPEG, base64: false }
-              );
-              fileUri = manipResult.uri;
+              // TÍNH NĂNG MỚI: áp dụng góc xoay thật (rotations) trước khi resize
+              const rotateDeg = rotations[actualIndex] || 0;
+              let rotatedUri = imgUri;
+              if (rotateDeg !== 0) {
+                const rotResult = await ImageManipulator.manipulateAsync(
+                  imgUri,
+                  [{ rotate: rotateDeg }],
+                  { compress: 1, format: ImageManipulator.SaveFormat.JPEG, base64: false }
+                );
+                rotatedUri = rotResult.uri;
+                generatedTempUris.push(rotResult.uri);
+              }
+
+              if (targetSizeMode) {
+                fileUri = await compressImageToTargetSize(rotatedUri, targetSizeKB, targetWidth);
+                if (fileUri !== rotatedUri && fileUri !== imgUri) {
+                  generatedTempUris.push(fileUri);
+                }
+              } else {
+                const manipResult = await ImageManipulator.manipulateAsync(
+                  rotatedUri,
+                  [{ resize: { width: targetWidth } }],
+                  { compress: targetCompress, format: ImageManipulator.SaveFormat.JPEG, base64: false }
+                );
+                fileUri = manipResult.uri;
+                generatedTempUris.push(manipResult.uri);
+              }
             } catch (e) {
               console.warn('[Scanner] Image process error:', e);
               fileUri = imgUri;
             }
           }
+          const watermarkHtml = addWatermark
+            ? `<div class="wm">${new Date().toLocaleString('vi-VN')} · Trang ${actualIndex + 1}/${images.length}</div>`
+            : '';
           return `<div class="page">
             <img id="scanImg_${actualIndex}" src="${fileUri}" style="${filterMode !== 'magic' ? `filter: ${cssFilter};` : ''}" crossorigin="anonymous" />
             ${watermark ? `<div class="watermark">${watermark}</div>` : ''}
+            ${watermarkHtml}
           </div>`;
         })
       );
       imgTagsArray.push(...processedBatch);
+
+      const processedCount = Math.min(i + BATCH_SIZE, images.length);
+      const percent = Math.round(5 + (processedCount / images.length) * 75);
+      onProgress?.(percent, `Đang xử lý trang ${processedCount}/${images.length} (${percent}%)...`);
     }
     const imgTags = imgTagsArray.join('');
+
+    onProgress?.(85, 'Đang kết xuất tệp PDF (85%)...');
 
     const html = `<!DOCTYPE html>
       <html>
@@ -373,11 +615,11 @@ export default function ScannerScreen({ route, navigation }: any) {
           <meta charset="utf-8"/>
           <style>
             * { margin: 0; padding: 0; box-sizing: border-box; }
-            @page { size: 2480px 3508px; margin: 0; }
+            @page { size: ${pageWidth} ${pageHeight}; margin: 0; }
             html, body { width: 100%; background: white; }
             .page {
-              width: 2480px;
-              height: 3508px;
+              width: ${pageWidth};
+              height: ${pageHeight};
               display: flex;
               justify-content: center;
               align-items: center;
@@ -398,15 +640,27 @@ export default function ScannerScreen({ route, navigation }: any) {
               left: 5%;
               width: 90%;
               transform: rotate(-30deg);
-              font-size: 85px;
+              font-size: ${isIdCard ? '45px' : '85px'};
               font-family: Arial, Helvetica, sans-serif;
               color: rgba(220, 53, 69, 0.28);
               font-weight: 900;
               text-align: center;
               pointer-events: none;
               text-transform: uppercase;
-              letter-spacing: 12px;
+              letter-spacing: ${isIdCard ? '6px' : '12px'};
               z-index: 99;
+            }
+            .wm {
+              position: absolute;
+              right: 40px;
+              bottom: 30px;
+              font-family: sans-serif;
+              font-size: 26px;
+              color: rgba(0,0,0,0.55);
+              background: rgba(255,255,255,0.75);
+              padding: 8px 18px;
+              border-radius: 6px;
+              z-index: 5;
             }
           </style>
         </head>
@@ -447,10 +701,19 @@ export default function ScannerScreen({ route, navigation }: any) {
 
     const { uri } = await Print.printToFileAsync({
       html,
-      width: 595.28,
-      height: 841.89, 
+      width: printWidth,
+      height: printHeight, 
       base64: false
     });
+
+    // Dọn dẹp ngay các file ảnh resize tạm sinh ra cho HTML Print để giải phóng dung lượng bộ nhớ
+    if (generatedTempUris.length > 0) {
+      for (const tempUri of generatedTempUris) {
+        FileSystem.deleteAsync(tempUri, { idempotent: true }).catch(() => {});
+      }
+    }
+
+    onProgress?.(100, 'Hoàn tất tạo tệp PDF! (100%)');
     return uri;
   };
 
@@ -462,8 +725,13 @@ export default function ScannerScreen({ route, navigation }: any) {
     if (images.length === 0) return;
     
     setSaving(true);
+    setExportProgress(0);
+    setExportStatusText('Bắt đầu xử lý...');
     try {
-      const uri = await createPdf();
+      const uri = await createPdf((percent, statusText) => {
+        setExportProgress(percent);
+        setExportStatusText(statusText);
+      });
       await savePdfToDocuments(uri, fileName);
 
       // Xử lý setting 'Giữ ảnh gốc' (saveOriginal)
@@ -480,52 +748,72 @@ export default function ScannerScreen({ route, navigation }: any) {
             const dest = `${imgFolder}trang_${i + 1}.jpg`;
             if (src.startsWith('file://')) {
               await FileSystem.copyAsync({ from: src, to: dest });
+              // Xóa file cache tạm sau khi đã sao chép sang Documents
+              if (isTempCacheUri(src)) {
+                await FileSystem.deleteAsync(src, { idempotent: true }).catch(() => {});
+              }
             }
           }
         } catch (imgErr) {
           console.warn('[Scanner] Could not copy original images:', imgErr);
         }
       } else {
-        // Dọn dẹp an toàn: chỉ xóa các file ảnh tạm do app sinh ra trong cacheDirectory,
-        // tuyệt đối không xóa nhầm ảnh gốc được chọn từ thư viện thiết bị
-        for (const imgUri of images) {
-          try {
-            if (imgUri.startsWith('file://')) {
-              const isAppCache = FileSystem.cacheDirectory && imgUri.startsWith(FileSystem.cacheDirectory);
-              if (isAppCache) {
-                await FileSystem.deleteAsync(imgUri, { idempotent: true });
-              }
-            }
-          } catch (delErr) {
-            console.warn('[Scanner] Could not clean up temp image:', delErr);
-          }
-        }
+        // Dọn dẹp an toàn: chỉ xóa các file ảnh tạm do app sinh ra trong cacheDirectory
+        await cleanupTempImages(images);
+      }
+
+      // Dọn sạch toàn bộ ảnh tạm do ImageManipulator tạo ra sau khi xuất PDF thành công
+      try {
+        await cleanupTempCache();
+      } catch (cacheErr) {
+        console.warn('[Scanner] cleanupTempCache error:', cacheErr);
       }
 
       // Xóa draft session sau khi lưu thành công
-      await Storage.removeItem(DRAFT_SCAN_SESSION_KEY);
+      await removeDraftSession();
 
+      hasSavedRef.current = true;
       Alert.alert('Thành công', 'Đã lưu PDF vào thư mục Tài liệu!');
-      navigation.goBack();
+      safeGoBack();
     } catch (error: any) {
       console.error(error);
       Alert.alert('Lỗi', `Không thể lưu PDF: ${error.message || String(error)}`);
     } finally {
       setSaving(false);
+      setExportProgress(0);
+      setExportStatusText('');
     }
   };
 
   const handleShare = async () => {
     if (images.length === 0) return;
     setSharing(true);
+    setExportProgress(0);
+    setExportStatusText('Bắt đầu xử lý...');
+    let tempPdfUri: string | null = null;
     try {
-      const uri = await createPdf();
-      await Sharing.shareAsync(uri, { UTI: '.pdf', mimeType: 'application/pdf', dialogTitle: 'Chia sẻ tài liệu' });
+      tempPdfUri = await createPdf((percent, statusText) => {
+        setExportProgress(percent);
+        setExportStatusText(statusText);
+      });
+      await Sharing.shareAsync(tempPdfUri, { UTI: '.pdf', mimeType: 'application/pdf', dialogTitle: 'Chia sẻ tài liệu' });
+
+      // Dọn sạch toàn bộ ảnh tạm do ImageManipulator tạo ra sau khi xuất PDF thành công
+      try {
+        await cleanupTempCache();
+      } catch (cacheErr) {
+        console.warn('[Scanner] cleanupTempCache error:', cacheErr);
+      }
     } catch (error: any) {
       console.error(error);
       Alert.alert('Lỗi', `Không thể chia sẻ PDF: ${error.message || String(error)}`);
     } finally {
+      if (tempPdfUri && isTempCacheUri(tempPdfUri)) {
+        FileSystem.deleteAsync(tempPdfUri, { idempotent: true }).catch(() => {});
+      }
       setSharing(false);
+      setExportProgress(0);
+      setExportStatusText('');
     }
   };
 
@@ -538,11 +826,21 @@ export default function ScannerScreen({ route, navigation }: any) {
     );
   }
 
+  const getCardAspectStyle = () => {
+    if (aspectRatioMode === 'a4') {
+      return { aspectRatio: 1 / 1.414, height: undefined };
+    }
+    if (aspectRatioMode === 'id_card') {
+      return { aspectRatio: 85.6 / 54, height: undefined };
+    }
+    return { aspectRatio: undefined, height: '82%' as const };
+  };
+
   // Preview Mode
   return (
     <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.container}>
       <View style={styles.header}>
-        <TouchableOpacity style={styles.backBtn} onPress={() => navigation.goBack()}>
+        <TouchableOpacity style={styles.backBtn} onPress={safeGoBack}>
           <Ionicons name="chevron-back" size={28} color="#fff" />
         </TouchableOpacity>
         <Text style={styles.headerText}>Chỉnh sửa ({images.length})</Text>
@@ -560,8 +858,12 @@ export default function ScannerScreen({ route, navigation }: any) {
           keyExtractor={(_, i) => i.toString()}
           renderItem={({ item, index }) => (
             <View style={styles.slide}>
-              <View style={styles.imageCardWrapper}>
-                <Image source={{ uri: item }} style={styles.previewImage} resizeMode="contain" />
+              <View style={[styles.imageCardWrapper, getCardAspectStyle()]}>
+                <Image
+                  source={{ uri: item }}
+                  style={[styles.previewImage, { transform: [{ rotate: `${rotations[index] || 0}deg` }] }]}
+                  resizeMode="contain"
+                />
 
                 {/* Page Number Badge */}
                 <View style={styles.pageBadge}>
@@ -570,6 +872,17 @@ export default function ScannerScreen({ route, navigation }: any) {
 
                 {/* Status Badges */}
                 <View style={styles.badgeContainer}>
+                  {/* Aspect Ratio Badge */}
+                  <View style={[styles.magicBadge, { backgroundColor: '#1976d2' }]}>
+                    <Ionicons
+                      name={aspectRatioMode === 'a4' ? 'document-text-outline' : aspectRatioMode === 'id_card' ? 'card-outline' : 'expand-outline'}
+                      size={12}
+                      color="#fff"
+                    />
+                    <Text style={styles.magicBadgeText}>
+                      {aspectRatioMode === 'a4' ? 'Khổ A4' : aspectRatioMode === 'id_card' ? 'Thẻ ID' : 'Tự do'}
+                    </Text>
+                  </View>
                   {filterMode === 'magic' && (
                     <View style={styles.magicBadge}>
                       <Ionicons name="sparkles" size={12} color="#fff" />
@@ -643,6 +956,57 @@ export default function ScannerScreen({ route, navigation }: any) {
         />
       )}
 
+      {/* Aspect Ratio Selector Row */}
+      <View style={styles.aspectRatioRow}>
+        <View style={styles.aspectRatioTitleBox}>
+          <Ionicons name="crop" size={15} color="#00bfa5" />
+          <Text style={styles.aspectRatioTitle}>Khung hình:</Text>
+        </View>
+        <View style={styles.aspectRatioButtons}>
+          <TouchableOpacity
+            style={[styles.aspectRatioBtn, aspectRatioMode === 'a4' && styles.aspectRatioBtnActive]}
+            onPress={() => setAspectRatioMode('a4')}
+          >
+            <Ionicons
+              name="document-text-outline"
+              size={14}
+              color={aspectRatioMode === 'a4' ? '#fff' : '#aaa'}
+            />
+            <Text style={[styles.aspectRatioBtnText, aspectRatioMode === 'a4' && styles.aspectRatioBtnTextActive]}>
+              A4
+            </Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.aspectRatioBtn, aspectRatioMode === 'id_card' && styles.aspectRatioBtnActive]}
+            onPress={() => setAspectRatioMode('id_card')}
+          >
+            <Ionicons
+              name="card-outline"
+              size={14}
+              color={aspectRatioMode === 'id_card' ? '#fff' : '#aaa'}
+            />
+            <Text style={[styles.aspectRatioBtnText, aspectRatioMode === 'id_card' && styles.aspectRatioBtnTextActive]}>
+              Thẻ ID
+            </Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.aspectRatioBtn, aspectRatioMode === 'free' && styles.aspectRatioBtnActive]}
+            onPress={() => setAspectRatioMode('free')}
+          >
+            <Ionicons
+              name="expand-outline"
+              size={14}
+              color={aspectRatioMode === 'free' ? '#fff' : '#aaa'}
+            />
+            <Text style={[styles.aspectRatioBtnText, aspectRatioMode === 'free' && styles.aspectRatioBtnTextActive]}>
+              Tự do
+            </Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+
       <View style={styles.colorModeRow}>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.modeScroll}>
           <TouchableOpacity
@@ -678,6 +1042,39 @@ export default function ScannerScreen({ route, navigation }: any) {
           </TouchableOpacity>
         </ScrollView>
       </View>
+
+      {/* TÍNH NĂNG MỚI: Đóng dấu ngày giờ + số trang lên PDF xuất ra */}
+      <TouchableOpacity
+        style={styles.watermarkRow}
+        onPress={() => setAddWatermark(v => !v)}
+        activeOpacity={0.7}
+      >
+        <Ionicons name={addWatermark ? 'checkbox' : 'square-outline'} size={18} color={addWatermark ? '#00bfa5' : '#888'} />
+        <Text style={styles.watermarkRowText}>Đóng dấu ngày giờ &amp; số trang lên PDF</Text>
+      </TouchableOpacity>
+
+      {/* TÍNH NĂNG MỚI: Nén theo dung lượng mục tiêu — tiện khi gửi email/Zalo có giới hạn */}
+      <TouchableOpacity
+        style={styles.watermarkRow}
+        onPress={() => setTargetSizeMode(v => !v)}
+        activeOpacity={0.7}
+      >
+        <Ionicons name={targetSizeMode ? 'checkbox' : 'square-outline'} size={18} color={targetSizeMode ? '#00bfa5' : '#888'} />
+        <Text style={styles.watermarkRowText}>Nén mỗi trang xuống ~{targetSizeKB}KB (cho gửi email/Zalo)</Text>
+      </TouchableOpacity>
+      {targetSizeMode && (
+        <View style={styles.targetSizeRow}>
+          {[200, 500, 1000].map(kb => (
+            <TouchableOpacity
+              key={kb}
+              style={[styles.targetSizeBtn, targetSizeKB === kb && styles.targetSizeBtnActive]}
+              onPress={() => setTargetSizeKB(kb)}
+            >
+              <Text style={[styles.targetSizeBtnText, targetSizeKB === kb && styles.targetSizeBtnTextActive]}>{kb}KB</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+      )}
 
       {/* Watermark Dialog */}
       <Modal visible={watermarkModalVisible} transparent animationType="fade">
@@ -754,6 +1151,30 @@ export default function ScannerScreen({ route, navigation }: any) {
                 <Text style={{ color: '#fff', fontWeight: 'bold' }}>Áp dụng</Text>
               </TouchableOpacity>
             </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Export Progress Modal */}
+      <Modal visible={saving || sharing} transparent animationType="fade">
+        <View style={styles.progressModalBg}>
+          <View style={styles.progressDialog}>
+            <View style={styles.progressIconBox}>
+              <Ionicons name="document-text" size={36} color="#00bfa5" />
+            </View>
+            <Text style={styles.progressTitle}>
+              {saving ? 'Đang xuất tệp PDF...' : 'Đang chuẩn bị chia sẻ PDF...'}
+            </Text>
+            <Text style={styles.progressPercentText}>{exportProgress}%</Text>
+            
+            {/* Progress Bar Track & Fill */}
+            <View style={styles.progressBarTrack}>
+              <View style={[styles.progressBarFill, { width: `${Math.max(0, Math.min(100, exportProgress))}%` }]} />
+            </View>
+
+            <Text style={styles.progressStatusText} numberOfLines={2}>
+              {exportStatusText || 'Đang xử lý tài liệu...'}
+            </Text>
           </View>
         </View>
       </Modal>
@@ -902,5 +1323,65 @@ const styles = StyleSheet.create({
   watermarkBtn: {
     height: 42, borderRadius: 10, justifyContent: 'center', alignItems: 'center',
     paddingHorizontal: 18
-  }
+  },
+
+  // Aspect Ratio Selector Styles
+  aspectRatioRow: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingHorizontal: 16, paddingVertical: 8, backgroundColor: '#161616',
+    borderBottomWidth: 1, borderBottomColor: '#252525'
+  },
+  aspectRatioTitleBox: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  aspectRatioTitle: { color: '#bbb', fontSize: 13, fontWeight: '600' },
+  aspectRatioButtons: { flexDirection: 'row', gap: 8 },
+  aspectRatioBtn: {
+    flexDirection: 'row', alignItems: 'center', gap: 4,
+    paddingVertical: 6, paddingHorizontal: 10, borderRadius: 14,
+    backgroundColor: '#252525', borderWidth: 1, borderColor: '#333'
+  },
+  aspectRatioBtnActive: { backgroundColor: '#00bfa5', borderColor: '#00bfa5' },
+  aspectRatioBtnText: { color: '#aaa', fontSize: 12, fontWeight: '600' },
+  aspectRatioBtnTextActive: { color: '#fff', fontWeight: 'bold' },
+
+  // Progress Bar Modal Styles
+  progressModalBg: {
+    flex: 1, backgroundColor: 'rgba(0,0,0,0.75)',
+    justifyContent: 'center', alignItems: 'center', padding: 24
+  },
+  progressDialog: {
+    width: '100%', maxWidth: 340, backgroundColor: '#1e1e1e',
+    borderRadius: 16, padding: 24, alignItems: 'center',
+    borderWidth: 1, borderColor: '#333'
+  },
+  progressIconBox: {
+    width: 64, height: 64, borderRadius: 32,
+    backgroundColor: 'rgba(0, 191, 165, 0.15)',
+    justifyContent: 'center', alignItems: 'center', marginBottom: 12
+  },
+  progressTitle: { color: '#fff', fontSize: 16, fontWeight: 'bold', marginBottom: 6, textAlign: 'center' },
+  progressPercentText: { color: '#00bfa5', fontSize: 28, fontWeight: 'bold', marginBottom: 12 },
+  progressBarTrack: {
+    width: '100%', height: 8, backgroundColor: '#333',
+    borderRadius: 4, overflow: 'hidden', marginBottom: 12
+  },
+  progressBarFill: { height: '100%', backgroundColor: '#00bfa5', borderRadius: 4 },
+  progressStatusText: { color: '#aaa', fontSize: 13, textAlign: 'center', lineHeight: 18 },
+
+  watermarkRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 8,
+    backgroundColor: '#1a1a1a', paddingVertical: 10, paddingHorizontal: 16,
+    borderBottomWidth: 1, borderBottomColor: '#2a2a2a'
+  },
+  watermarkRowText: { color: '#ccc', fontSize: 13 },
+  targetSizeRow: {
+    flexDirection: 'row', gap: 8, paddingHorizontal: 16, paddingVertical: 8,
+    backgroundColor: '#1a1a1a', borderBottomWidth: 1, borderBottomColor: '#2a2a2a'
+  },
+  targetSizeBtn: {
+    paddingVertical: 6, paddingHorizontal: 14, borderRadius: 14,
+    backgroundColor: '#2a2a2a', borderWidth: 1, borderColor: '#333'
+  },
+  targetSizeBtnActive: { backgroundColor: '#00bfa5', borderColor: '#00bfa5' },
+  targetSizeBtnText: { color: '#aaa', fontSize: 12, fontWeight: '600' },
+  targetSizeBtnTextActive: { color: '#fff', fontWeight: 'bold' }
 });
